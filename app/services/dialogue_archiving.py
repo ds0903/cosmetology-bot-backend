@@ -1,0 +1,304 @@
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+from sqlalchemy.orm import Session
+from sqlalchemy import and_, desc, or_
+
+from ..database import Dialogue, ClientLastActivity, get_db
+from ..services.claude_service import ClaudeService
+from ..config import ProjectConfig, settings
+
+logger = logging.getLogger(__name__)
+
+
+class DialogueArchivingService:
+    """Service for compressing dialogues older than 24 hours into zip_history"""
+    
+    def __init__(self):
+        self.compression_hours = 24  # Always compress after 24 hours
+        logger.debug(f"DialogueArchivingService initialized with compression_hours={self.compression_hours}")
+    
+    async def compress_old_dialogues(self, project_configs: Dict[str, ProjectConfig]):
+        """Compress dialogues older than 24 hours into zip_history"""
+        logger.info(f"Starting dialogue compression process for {len(project_configs)} projects")
+        
+        # Get database session
+        from ..database import SessionLocal
+        db = SessionLocal()
+        
+        try:
+            # Find all clients that have dialogues older than compression_hours that need compression
+            cutoff_time = datetime.now() - timedelta(hours=self.compression_hours)
+            logger.info(f"Compressing dialogues older than {cutoff_time} (cutoff: {self.compression_hours} hours ago)")
+            
+            # Debug: Check total dialogues in database
+            total_dialogues = db.query(Dialogue).count()
+            unarchived_dialogues = db.query(Dialogue).filter(Dialogue.is_archived == False).count()
+            old_dialogues = db.query(Dialogue).filter(
+                Dialogue.timestamp < cutoff_time,
+                Dialogue.is_archived == False
+            ).count()
+            
+            logger.info(f"Database stats: Total dialogues: {total_dialogues}, Unarchived: {unarchived_dialogues}, Old dialogues (>{self.compression_hours}h): {old_dialogues}")
+            
+            # Get all clients with old dialogues that need compression
+            clients_to_process = db.query(Dialogue.project_id, Dialogue.client_id).filter(
+                Dialogue.timestamp < cutoff_time,
+                Dialogue.is_archived == False
+            ).distinct().all()
+            
+            logger.info(f"Found {len(clients_to_process)} clients with dialogues ready for compression")
+            
+            if not clients_to_process:
+                # Debug: Show recent dialogues regardless of archived status
+                recent_dialogues = db.query(Dialogue).order_by(Dialogue.timestamp.desc()).limit(10).all()
+                logger.info("Recent dialogues in database (all):")
+                for dlg in recent_dialogues:
+                    age_hours = (datetime.now() - dlg.timestamp).total_seconds() / 3600
+                    logger.info(f"  - Client {dlg.client_id}, Project {dlg.project_id}, Age: {age_hours:.1f}h, Time: {dlg.timestamp}, Archived: {dlg.is_archived}")
+                
+                # Check if we need to reset archived status for testing
+                if total_dialogues > 0 and unarchived_dialogues == 0:
+                    logger.warning("All dialogues are marked as archived! This might indicate a previous archiving run or data migration issue.")
+                    logger.info("For testing, you may want to reset some dialogues to unarchived status.")
+                
+                logger.info("No dialogues to compress at this time")
+                return
+            
+            compressed_count = 0
+            error_count = 0
+            
+            for project_id, client_id in clients_to_process:
+                try:
+                    project_config = project_configs.get(project_id)
+                    if not project_config:
+                        logger.warning(f"No project config found for project_id={project_id}, skipping client {client_id}")
+                        continue
+                    
+                    logger.debug(f"Processing compression for client_id={client_id}, project_id={project_id}")
+                    
+                    # Get or create ClientLastActivity record
+                    activity = db.query(ClientLastActivity).filter(
+                        and_(
+                            ClientLastActivity.project_id == project_id,
+                            ClientLastActivity.client_id == client_id
+                        )
+                    ).first()
+                    
+                    if not activity:
+                        # Create new activity record
+                        activity = ClientLastActivity(
+                            project_id=project_id,
+                            client_id=client_id,
+                            last_message_at=datetime.utcnow()
+                        )
+                        db.add(activity)
+                        db.flush()  # Get the ID
+                    
+                    # Get old dialogues (older than 24 hours) that are not archived
+                    old_dialogues = db.query(Dialogue).filter(
+                        and_(
+                            Dialogue.project_id == project_id,
+                            Dialogue.client_id == client_id,
+                            Dialogue.timestamp < cutoff_time,
+                            Dialogue.is_archived == False
+                        )
+                    ).order_by(Dialogue.timestamp).all()
+                    
+                    if not old_dialogues:
+                        logger.debug(f"No old dialogues found for client_id={client_id}")
+                        continue
+                    
+                    logger.info(f"Compressing {len(old_dialogues)} old dialogues for client_id={client_id}")
+                    
+                    # Build dialogue history string for compression
+                    old_dialogue_history = self._build_dialogue_history(old_dialogues)
+                    logger.debug(f"Built old dialogue history ({len(old_dialogue_history)} chars) for client_id={client_id}")
+                    
+                    # Compress using Claude
+                    claude_service = ClaudeService(db)
+                    logger.debug(f"Starting dialogue compression for client_id={client_id}")
+                    
+                    # If there's existing zip_history, combine it with new dialogues
+                    if activity.zip_history:
+                        combined_history = f"{activity.zip_history}\n\n--- Новые сообщения ---\n{old_dialogue_history}"
+                        compressed_history = await claude_service.compress_dialogue(
+                            project_config,
+                            combined_history
+                        )
+                    else:
+                        compressed_history = await claude_service.compress_dialogue(
+                            project_config,
+                            old_dialogue_history
+                        )
+                    
+                    logger.debug(f"Dialogue compressed to {len(compressed_history)} chars for client_id={client_id}")
+                    
+                    # Update client activity with new compressed history
+                    activity.zip_history = compressed_history
+                    activity.last_compression_at = datetime.utcnow()
+                    
+                    # Mark old dialogues as archived
+                    for dialogue in old_dialogues:
+                        dialogue.is_archived = True
+                    
+                    db.commit()
+                    
+                    logger.info(f"Successfully compressed {len(old_dialogues)} dialogues for client_id={client_id}")
+                    compressed_count += 1
+                    
+                    # Small delay to not overwhelm Claude API
+                    await asyncio.sleep(1)
+                    
+                except Exception as client_error:
+                    logger.error(f"Error compressing dialogues for client_id={client_id}: {client_error}", exc_info=True)
+                    db.rollback()
+                    error_count += 1
+                    # Continue with next client
+                    continue
+            
+            logger.info(f"Dialogue compression completed: {compressed_count} clients processed successfully, {error_count} errors")
+            
+        except Exception as e:
+            logger.error(f"Error during dialogue compression process: {e}", exc_info=True)
+            db.rollback()
+        finally:
+            db.close()
+            logger.debug("Database session closed for dialogue compression")
+    
+    def _build_dialogue_history(self, dialogues: List[Dialogue]) -> str:
+        """Build dialogue history string from dialogue entries"""
+        logger.debug(f"Building dialogue history from {len(dialogues)} entries")
+        
+        history_lines = []
+        
+        for dialogue in dialogues:  # Reverse to chronological order
+            role = "Клиент" if dialogue.role == "client" else "Бот"
+            timestamp = dialogue.timestamp.strftime("%d.%m %H:%M")
+            history_lines.append(f"[{timestamp}] {role}: {dialogue.message}")
+        
+        history_text = "\n".join(history_lines)
+        logger.debug(f"Built dialogue history: {len(history_text)} characters, {len(history_lines)} lines")
+        
+        return history_text
+    
+    def get_recent_dialogue_history(self, db: Session, project_id: str, client_id: str) -> str:
+        """Get dialogue history from last 24 hours for active conversation"""
+        cutoff_time = datetime.utcnow() - timedelta(hours=self.compression_hours)
+        
+        recent_dialogues = db.query(Dialogue).filter(
+            and_(
+                Dialogue.project_id == project_id,
+                Dialogue.client_id == client_id,
+                Dialogue.timestamp >= cutoff_time,
+                Dialogue.is_archived == False
+            )
+        ).order_by(Dialogue.timestamp).all()
+        
+        if not recent_dialogues:
+            return ""
+        
+        return self._build_dialogue_history(recent_dialogues)
+    
+    def get_zip_history(self, db: Session, project_id: str, client_id: str) -> Optional[str]:
+        """Get compressed dialogue history for a client"""
+        activity = db.query(ClientLastActivity).filter(
+            and_(
+                ClientLastActivity.project_id == project_id,
+                ClientLastActivity.client_id == client_id
+            )
+        ).first()
+        
+        return activity.zip_history if activity else None
+    
+    def add_dialogue_entry(self, db: Session, project_id: str, client_id: str, role: str, message: str):
+        """Add new dialogue entry and update client activity"""
+        # Add dialogue entry
+        dialogue = Dialogue(
+            project_id=project_id,
+            client_id=client_id,
+            role=role,
+            message=message,
+            timestamp=datetime.utcnow()
+        )
+        db.add(dialogue)
+        
+        # Update or create client activity
+        activity = db.query(ClientLastActivity).filter(
+            and_(
+                ClientLastActivity.project_id == project_id,
+                ClientLastActivity.client_id == client_id
+            )
+        ).first()
+        
+        if activity:
+            activity.last_message_at = datetime.utcnow()
+        else:
+            activity = ClientLastActivity(
+                project_id=project_id,
+                client_id=client_id,
+                last_message_at=datetime.utcnow()
+            )
+            db.add(activity)
+        
+        db.commit()
+        logger.debug(f"Added dialogue entry for client_id={client_id}, role={role}")
+    
+    def get_archiving_stats(self, db: Session) -> Dict[str, Any]:
+        """Get archiving statistics"""
+        logger.debug("Getting dialogue archiving statistics")
+        
+        try:
+            total_dialogues = db.query(Dialogue).count()
+            archived_dialogues = db.query(Dialogue).filter(
+                Dialogue.is_archived == True
+            ).count()
+            
+            # Try to get clients_with_archives, but handle missing column gracefully
+            try:
+                clients_with_archives = db.query(ClientLastActivity).filter(
+                    ClientLastActivity.zip_history.isnot(None)
+                ).count()
+            except Exception as column_error:
+                logger.warning(f"Could not query zip_history column (migration needed?): {column_error}")
+                clients_with_archives = 0
+            
+            stats = {
+                "total_dialogues": total_dialogues,
+                "archived_dialogues": archived_dialogues,
+                "active_dialogues": total_dialogues - archived_dialogues,
+                "clients_with_archives": clients_with_archives
+            }
+            
+            logger.debug(f"Archiving stats: {stats}")
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting archiving stats: {e}")
+            return {
+                "total_dialogues": 0,
+                "archived_dialogues": 0,
+                "active_dialogues": 0,
+                "clients_with_archives": 0
+            }
+
+
+# Background task to run compression periodically
+async def run_dialogue_compression_task(project_configs: Dict[str, ProjectConfig]):
+    """Background task to run dialogue compression every hour"""
+    logger.info("Starting dialogue compression background task")
+    compression_service = DialogueArchivingService()
+    
+    while True:
+        try:
+            logger.debug("Running scheduled dialogue compression")
+            await compression_service.compress_old_dialogues(project_configs)
+            logger.debug("Scheduled dialogue compression completed, waiting 1 hour for next run")
+            # Wait 1 hour before next run
+            await asyncio.sleep(3600)
+        except Exception as e:
+            logger.error(f"Error in compression task: {e}", exc_info=True)
+            logger.info("Waiting 10 minutes before retry after error")
+            # Wait 10 minutes before retry
+            await asyncio.sleep(600) 

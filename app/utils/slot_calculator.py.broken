@@ -1,0 +1,108 @@
+from typing import List, Dict
+from datetime import datetime, timedelta
+
+def recalculate_slots_for_duration(available_slots: List[str], time_fraction: int) -> List[str]:
+    """
+    Пересчитывает доступные слоты для услуг с длительностью > 30 минут.
+    """
+    if time_fraction == 1:
+        return available_slots
+    
+    valid_slots = []
+    slot_times = []
+    
+    for slot in available_slots:
+        try:
+            hour, minute = map(int, slot.split(':'))
+            slot_time = datetime(2000, 1, 1, hour, minute)
+            slot_times.append((slot, slot_time))
+        except:
+            continue
+    
+    for slot_str, slot_time in slot_times:
+        can_fit = True
+        
+        for i in range(1, time_fraction):
+            next_time = slot_time + timedelta(minutes=30 * i)
+            next_slot_str = f"{next_time.hour:02d}:{next_time.minute:02d}"
+            
+            if next_slot_str not in available_slots:
+                can_fit = False
+                break
+        
+        if can_fit:
+            valid_slots.append(slot_str)
+    
+    return valid_slots
+
+def apply_duration_to_all_specialists(slots_dict: Dict, time_fraction: int) -> Dict:
+    """
+    Применяет пересчет для всех специалистов в словаре слотов.
+    """
+    if time_fraction == 1:
+        return slots_dict
+    
+    result = {}
+    for specialist, slots in slots_dict.items():
+        if isinstance(slots, list):
+            result[specialist] = recalculate_slots_for_duration(slots, time_fraction)
+        else:
+            result[specialist] = slots
+    
+    return result
+
+def recalculate_reserved_slots_for_duration(reserved_slots: List[str], time_fraction: int, all_work_slots: List[str]) -> List[str]:
+    """
+    Пересчитывает зарезервированные слоты для услуг с длительностью > 30 минут.
+    """
+    if time_fraction == 1:
+        return reserved_slots
+    
+    expanded_reserved = set(reserved_slots)
+    
+    for slot in reserved_slots:
+        try:
+            hour, minute = map(int, slot.split(':'))
+            slot_time = datetime(2000, 1, 1, hour, minute)
+            
+            for i in range(1, time_fraction):
+                prev_time = slot_time - timedelta(minutes=30 * i)
+                prev_slot = f"{prev_time.hour:02d}:{prev_time.minute:02d}"
+                if prev_slot in all_work_slots:
+                    expanded_reserved.add(prev_slot)
+            
+            for i in range(1, time_fraction):
+                next_time = slot_time + timedelta(minutes=30 * i)
+                next_slot = f"{next_time.hour:02d}:{next_time.minute:02d}"
+                if next_slot in all_work_slots:
+                    expanded_reserved.add(next_slot)
+        except:
+            continue
+    
+    return sorted(list(expanded_reserved))
+
+def apply_reserved_duration_to_all_specialists(reserved_dict: Dict, available_dict: Dict, time_fraction: int) -> Dict:
+    """
+    Применяет пересчет reserved_slots для всех специалистов.
+    """
+    if time_fraction == 1:
+        return reserved_dict
+    
+    result = {}
+    for specialist, reserved in reserved_dict.items():
+        specialist_available_key = specialist.replace('reserved_slots_', 'available_slots_')
+        all_slots = set()
+        
+        if specialist_available_key in available_dict:
+            all_slots.update(available_dict[specialist_available_key])
+        if isinstance(reserved, list):
+            all_slots.update(reserved)
+        
+        all_work_slots = sorted(list(all_slots))
+        
+        if isinstance(reserved, list):
+            result[specialist] = recalculate_reserved_slots_for_duration(reserved, time_fraction, all_work_slots)
+        else:
+            result[specialist] = reserved
+    
+    return result
