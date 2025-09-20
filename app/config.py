@@ -72,6 +72,7 @@ class ProjectConfig:
         self.database_table_name = f"bookings_{project_id}"
         self.google_sheet_id = settings.google_sheet_id
         self.google_sheet_make_id = getattr(settings, "google_sheet_make_id", "")
+        self.google_drive_folder_id = settings.google_drive_folder_id
         self.claude_prompts = get_all_prompts()
         self.services = {}  # service_name -> duration_in_slots
         self.specialists = []
