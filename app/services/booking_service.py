@@ -34,9 +34,16 @@ class BookingService:
         
         try:
             if claude_response.activate_booking:
-                logger.info(f"Message ID: {message_id} - Processing booking activation for client_id={client_id}")
-                result = await self._activate_booking(claude_response, client_id, message_id, contact_send_id)
+
+                if claude_response.double_booking and claude_response.specialists_list:
+                    logger.info(f"Message ID: {message_id} - Processing DOUBLE booking activation")
+                    result = await self._activate_double_booking(claude_response, client_id, message_id,
+                                                                 contact_send_id)
+                else:
+                    logger.info(f"Message ID: {message_id} - Processing SINGLE booking activation")
+                    result = await self._activate_booking(claude_response, client_id, message_id, contact_send_id)
                 result["action"] = "activate"
+
             elif claude_response.reject_order:
                 logger.info(f"Message ID: {message_id} - Processing booking rejection for client_id={client_id}")
                 result = await self._reject_booking(claude_response, client_id, message_id)
@@ -308,99 +315,151 @@ class BookingService:
                 "success": False,
                 "message": f"Ошибка при создании записи: {str(e)}"
             }
-    
+
     async def _reject_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[str, Any]:
-        """Reject/cancel a booking"""
+        """Reject/cancel a booking (single or double)"""
         try:
-            # Validate required fields for rejection
-            if not all([response.cosmetolog, response.time_reject, response.date_reject]):
+            # Проверяем, это двойная запись или одинарная
+            if response.double_booking and response.specialists_list:
+                logger.info(f"Message ID: {message_id} - Processing DOUBLE booking rejection")
+                return await self._reject_double_booking(response, client_id, message_id)
+            else:
+                logger.info(f"Message ID: {message_id} - Processing SINGLE booking rejection")
+                return await self._reject_single_booking(response, client_id, message_id)
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Ошибка при отмене записи: {str(e)}"
+            }
+
+    async def _reject_single_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
+        str, Any]:
+        """Reject/cancel a single booking"""
+        # Ваш существующий код _reject_booking переместить сюда
+        # ... (весь код из текущего _reject_booking)
+
+    async def _reject_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
+        str, Any]:
+        """Reject/cancel a double booking"""
+        try:
+            if not response.specialists_list or len(response.specialists_list) < 2:
                 return {
                     "success": False,
-                    "message": "Отсутствуют обязательные поля для отмены"
+                    "message": "Недостаточно специалистов для отмены двойной записи"
                 }
-            
+
             # Parse date and time
             booking_date = self._parse_date(response.date_reject)
             booking_time = self._parse_time(response.time_reject)
-            
+
             if not booking_date or not booking_time:
                 return {
                     "success": False,
                     "message": "Неверный формат даты или времени"
                 }
-            
-            # Find booking to cancel
-            booking = self.db.query(Booking).filter(
-                and_(
-                    Booking.project_id == self.project_config.project_id,
-                    Booking.client_id == client_id,
-                    Booking.specialist_name == response.cosmetolog,
-                    Booking.appointment_date == booking_date,
-                    Booking.appointment_time == booking_time,
-                    Booking.status == "active"
-                )
-            ).first()
-            
-            if not booking:
-                return {
-                    "success": False,
-                    "message": "Запись не найдена"
-                }
-            
-            # Cancel booking
-            booking.status = "cancelled"
-            booking.updated_at = datetime.utcnow()
-            self.db.commit()
-            
-            # Clear the specific booking slot in Google Sheets (with proper duration for multi-slot bookings)
-            try:
-                duration_slots = booking.duration_minutes // 30
-                logger.debug(f"Message ID: {message_id} - Clearing booking slot in Google Sheets for {booking.specialist_name} ({duration_slots} slots)")
-                sheets_success = await self.sheets_service.clear_booking_slot_async(
-                    booking.specialist_name, 
-                    booking.appointment_date, 
-                    booking.appointment_time,
-                    duration_slots
-                )
-                if sheets_success:
-                    logger.debug(f"Message ID: {message_id} - Google Sheets slot cleared successfully")
-                    # Логируем отмену в отдельный лист
+
+            cancelled_bookings = []
+
+            # Найти и отменить записи для ОБОИХ мастеров
+            for specialist in response.specialists_list:
+                booking = self.db.query(Booking).filter(
+                    and_(
+                        Booking.project_id == self.project_config.project_id,
+                        Booking.client_id == client_id,
+                        Booking.specialist_name == specialist,
+                        Booking.appointment_date == booking_date,
+                        Booking.appointment_time == booking_time,
+                        Booking.status == "active"
+                    )
+                ).first()
+
+                if booking:
+                    # Cancel booking
+                    booking.status = "cancelled"
+                    booking.updated_at = datetime.utcnow()
+                    cancelled_bookings.append(booking)
+
+                    # Clear slot in Google Sheets
                     try:
+                        duration_slots = booking.duration_minutes // 30
+                        await self.sheets_service.clear_booking_slot_async(
+                            booking.specialist_name,
+                            booking.appointment_date,
+                            booking.appointment_time,
+                            duration_slots
+                        )
+
+                        # Log cancellation
                         cancellation_data = {
                             "date": booking.appointment_date.strftime("%d.%m"),
                             "full_date": booking.appointment_date.strftime("%d.%m.%Y"),
                             "time": str(booking.appointment_time),
                             "client_id": client_id,
                             "client_name": booking.client_name or "Клиент",
-                            "service": booking.service_name,
-                            "specialist": booking.specialist_name
+                            "service": f"{booking.service_name} (двойная запись)",
+                            "specialist": specialist
                         }
                         await self.sheets_service.log_cancellation(cancellation_data)
-                        logger.info(f"Message ID: {message_id} - Cancellation logged to sheet")
-                    except Exception as log_error:
-                        logger.error(f"Message ID: {message_id} - Failed to log cancellation: {log_error}")
-                else:
-                    logger.warning(f"Message ID: {message_id} - Google Sheets slot clearing returned false")
-            except Exception as sheets_error:
-                logger.error(f"Message ID: {message_id} - Failed to clear booking slot in Google Sheets: {sheets_error}")
-                # Don't fail the cancellation for sheets issues
-            
+
+                    except Exception as sheets_error:
+                        logger.error(
+                            f"Message ID: {message_id} - Failed to clear booking slot for {specialist}: {sheets_error}")
+
+            self.db.commit()
+
+            if cancelled_bookings:
+                specialists_names = [b.specialist_name for b in cancelled_bookings]
+                return {
+                    "success": True,
+                    "message": f"Двойная запись отменена: {', '.join(specialists_names)}",
+                    "booking_ids": [b.id for b in cancelled_bookings]
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": "Записи не найдены для отмены"
+                }
+
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error cancelling double booking: {e}")
             return {
-                "success": True,
-                "message": "",  # Убрали сообщение об отмене
-                "booking_id": booking.id
+                "success": False,
+                "message": f"Ошибка при отмене двойной записи: {str(e)}"
             }
-            
+
+    async def _change_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[str, Any]:
+        """Change an existing booking (single or double)"""
+        try:
+            # Проверяем, это перенос в двойную запись или из двойной записи
+            if response.double_booking and response.specialists_list:
+                logger.info(f"Message ID: {message_id} - Processing DOUBLE booking change")
+                return await self._change_double_booking(response, client_id, message_id)
+            else:
+                logger.info(f"Message ID: {message_id} - Processing SINGLE booking change")
+                return await self._change_single_booking(response, client_id, message_id)
         except Exception as e:
             return {
                 "success": False,
-                "message": f"Ошибка при отмене записи: {str(e)}"
+                "message": f"Ошибка при изменении записи: {str(e)}"
             }
-    
-    async def _change_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[str, Any]:
-        """Change an existing booking"""
+
+    async def _change_single_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
+        str, Any]:
+        """Change a single booking"""
+        # Ваш существующий код _change_booking переместить сюда
+        # ... (весь код из текущего _change_booking)
+
+    async def _change_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
+        str, Any]:
+        """Change a double booking"""
         try:
-            # First, find the old booking to change
+            if not response.specialists_list or len(response.specialists_list) < 2:
+                return {
+                    "success": False,
+                    "message": "Недостаточно специалистов для переноса двойной записи"
+                }
+
+            # Найти существующие записи для переноса
             old_bookings = self.db.query(Booking).filter(
                 and_(
                     Booking.project_id == self.project_config.project_id,
@@ -408,193 +467,121 @@ class BookingService:
                     Booking.status == "active"
                 )
             ).all()
-            
+
             if not old_bookings:
                 return {
                     "success": False,
-                    "message": "Активная запись не найдена"
+                    "message": "Активные записи не найдены"
                 }
-            
-            # Find the booking that matches the service being changed
-            old_booking = None
-            
-            # First, try to find by service name if provided
-            if response.procedure:
-                matching_bookings = [b for b in old_bookings if response.procedure.lower() in b.service_name.lower()]
-                if matching_bookings:
-                    old_booking = sorted(matching_bookings, key=lambda x: x.created_at, reverse=True)[0]
-                    logger.info(f"Message ID: {message_id} - Found booking by service match: {old_booking.service_name}")
-            
-            # If no service match found, try to find by date/time if provided in reject fields
-            if not old_booking and response.date_reject and response.time_reject:
-                try:
-                    reject_date = self._parse_date(response.date_reject)
-                    reject_time = self._parse_time(response.time_reject)
-                    if reject_date and reject_time:
-                        date_time_bookings = [b for b in old_bookings 
-                                            if b.appointment_date == reject_date and b.appointment_time == reject_time]
-                        if date_time_bookings:
-                            old_booking = date_time_bookings[0]
-                            logger.info(f"Message ID: {message_id} - Found booking by date/time match: {old_booking.appointment_date} {old_booking.appointment_time}")
-                except Exception as e:
-                    logger.warning(f"Message ID: {message_id} - Error parsing reject date/time: {e}")
-            
-            # Fallback to most recent booking if no specific match found
-            if not old_booking:
-                old_booking = sorted(old_bookings, key=lambda x: x.created_at, reverse=True)[0]
-                logger.warning(f"Message ID: {message_id} - No specific booking match found, using most recent: {old_booking.service_name}")
-            
-            # Validate new booking data
-            if not all([response.cosmetolog, response.time_set_up, response.date_order]):
-                return {
-                    "success": False,
-                    "message": "Отсутствуют обязательные поля для изменения"
-                }
-            
+
             # Parse new date and time
             new_date = self._parse_date(response.date_order)
             new_time = self._parse_time(response.time_set_up)
-            
+
             if not new_date or not new_time:
                 return {
                     "success": False,
-                    "message": "Неверный формат даты или времени"
+                    "message": "Неверный формат новой даты или времени"
                 }
-            
-            # Check if specialist exists
-            if response.cosmetolog not in self.project_config.specialists:
-                return {
-                    "success": False,
-                    "message": f"Специалист {response.cosmetolog} не найден"
-                }
-            
-            # Determine service duration
-            duration_slots = 1
-            normalized_service = response.procedure or old_booking.service_name
-            
-            if response.procedure and response.procedure in self.project_config.services:
-                # Direct match found
-                duration_slots = self.project_config.services[response.procedure]
-                logger.info(f"Message ID: {message_id} - Service '{response.procedure}' requires {duration_slots} slots ({duration_slots * 30} minutes)")
-            elif response.procedure:
-                # No direct match - try service normalization
-                logger.info(f"Message ID: {message_id} - Service '{response.procedure}' not found in dictionary, attempting normalization...")
-                
-                from ..services.claude_service import ClaudeService
-                from ..database import SessionLocal
-                
-                try:
-                    # Create a new Claude service for normalization
-                    normalize_db = SessionLocal()
-                    claude_service = ClaudeService(normalize_db)
-                    
-                    normalized_service = await claude_service.normalize_service_name(
-                        self.project_config, 
-                        response.procedure, 
-                        message_id
-                    )
-                    
-                    if normalized_service in self.project_config.services:
-                        duration_slots = self.project_config.services[normalized_service]
-                        logger.info(f"Message ID: {message_id} - Normalized service '{normalized_service}' requires {duration_slots} slots ({duration_slots * 30} minutes)")
-                    else:
-                        logger.warning(f"Message ID: {message_id} - Service normalization failed, using default duration: 1 slot (30 minutes)")
-                    
-                    normalize_db.close()
-                    
-                except Exception as e:
-                    logger.error(f"Message ID: {message_id} - Error during service normalization: {e}")
-                    logger.warning(f"Message ID: {message_id} - Using default duration: 1 slot (30 minutes)")
-            else:
-                # Keep old service if no new service specified
-                if old_booking.service_name in self.project_config.services:
-                    duration_slots = self.project_config.services[old_booking.service_name]
-                    normalized_service = old_booking.service_name
-                    logger.info(f"Message ID: {message_id} - Keeping existing service '{old_booking.service_name}' with {duration_slots} slots")
-            
-            # FIRST check Google Sheets as primary source of truth
-            sheets_available = await self.sheets_service.is_slot_available_in_sheets_async(
-                response.cosmetolog, new_date, new_time
-            )
-            if not sheets_available:
-                logger.info(f"Message ID: {message_id} - Slot {new_time} on {new_date} is occupied in Google Sheets")
-                return {
-                    "success": False,
-                    "message": "Выбранное время уже занято"
-                }
-            
-            # Then check local DB (excluding the current booking)
 
-            # Check if new time slot is available (excluding the current booking)
-            if not self._is_slot_available(response.cosmetolog, new_date, new_time, duration_slots, exclude_booking_id=old_booking.id):
+            # Проверить доступность ОБОИХ новых мастеров
+            specialist1, specialist2 = response.specialists_list[0], response.specialists_list[1]
+
+            slot1_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist1, new_date,
+                                                                                          new_time)
+            slot2_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist2, new_date,
+                                                                                          new_time)
+
+            if not slot1_available or not slot2_available:
+                occupied_specialists = []
+                if not slot1_available:
+                    occupied_specialists.append(specialist1)
+                if not slot2_available:
+                    occupied_specialists.append(specialist2)
                 return {
                     "success": False,
-                    "message": "Выбранное время уже занято"
+                    "message": f"Новое время занято у мастера(ов): {', '.join(occupied_specialists)}"
                 }
-            
-            # Store old booking details for clearing the old slot
-            old_specialist = old_booking.specialist_name
-            old_date = old_booking.appointment_date
-            old_time = old_booking.appointment_time
-            old_duration_slots = old_booking.duration_minutes // 30  # Calculate slots from duration
-            
-            # Update the booking
-            old_booking.specialist_name = response.cosmetolog
-            old_booking.appointment_date = new_date
-            old_booking.appointment_time = new_time
-            old_booking.client_name = response.name or old_booking.client_name
-            old_booking.service_name = normalized_service
-            old_booking.client_phone = response.phone or old_booking.client_phone
-            old_booking.duration_minutes = duration_slots * 30
-            old_booking.updated_at = datetime.utcnow()
-            
+
+            # Найти записи для переноса (берем две последние активные записи клиента)
+            bookings_to_change = sorted(old_bookings, key=lambda x: x.created_at, reverse=True)[:2]
+
+            if len(bookings_to_change) < 2:
+                return {
+                    "success": False,
+                    "message": "Недостаточно записей для переноса в двойную запись"
+                }
+
+            # Сохранить старые данные для логирования
+            old_data = []
+            for booking in bookings_to_change:
+                old_data.append({
+                    "specialist": booking.specialist_name,
+                    "date": booking.appointment_date,
+                    "time": booking.appointment_time,
+                    "duration_slots": booking.duration_minutes // 30
+                })
+
+            # Очистить старые слоты
+            for i, booking in enumerate(bookings_to_change):
+                try:
+                    await self.sheets_service.clear_booking_slot_async(
+                        booking.specialist_name,
+                        booking.appointment_date,
+                        booking.appointment_time,
+                        booking.duration_minutes // 30
+                    )
+                except Exception as e:
+                    logger.error(f"Message ID: {message_id} - Failed to clear old slot: {e}")
+
+            # Обновить записи для новых мастеров
+            for i, booking in enumerate(bookings_to_change):
+                new_specialist = response.specialists_list[i]
+
+                booking.specialist_name = new_specialist
+                booking.appointment_date = new_date
+                booking.appointment_time = new_time
+                booking.client_name = response.name or booking.client_name
+                booking.service_name = response.procedure or booking.service_name
+                booking.client_phone = response.phone or booking.client_phone
+                booking.updated_at = datetime.utcnow()
+
             self.db.commit()
-            
-            # Update Google Sheets - clear old slot and add new slot
-            try:
-                # Clear the old booking slot (with proper duration for multi-slot bookings)
-                logger.debug(f"Message ID: {message_id} - Clearing old booking slot: {old_specialist} {old_date} {old_time} ({old_duration_slots} slots)")
-                await self.sheets_service.clear_booking_slot_async(old_specialist, old_date, old_time, old_duration_slots)
-                
-                # Add the new booking slot
-                logger.debug(f"Message ID: {message_id} - Adding new booking slot: {old_booking.specialist_name} {new_date} {new_time}")
-                sheets_success = await self.sheets_service.update_single_booking_slot_async(old_booking.specialist_name, old_booking)
-                if sheets_success:
-                    logger.debug(f"Message ID: {message_id} - Google Sheets booking change completed successfully")
-                else:
-                    logger.warning(f"Message ID: {message_id} - Google Sheets booking change returned false")
-            except Exception as sheets_error:
-                logger.error(f"Message ID: {message_id} - Failed to update booking change in Google Sheets: {sheets_error}")
-                # Don't fail the booking change for sheets issues
-            
-            try:
-                transfer_data = {
-                    "old_date": old_date.strftime("%d.%m"),
-                    "old_full_date": old_date.strftime("%d.%m.%Y"),
-                    "old_time": str(old_time),
-                    "new_date": new_date.strftime("%d.%m"),
-                    "new_time": str(new_time),
-                    "client_id": client_id,
-                    "client_name": old_booking.client_name or "Клиент",
-                    "service": old_booking.service_name,
-                    "old_specialist": old_specialist,
-                    "new_specialist": response.cosmetolog
-                }
-                await self.sheets_service.log_transfer(transfer_data)
-                logger.info(f"Message ID: {message_id} - Transfer logged to sheet")
-            except Exception as log_error:
-                logger.error(f"Message ID: {message_id} - Failed to log transfer: {log_error}")
+
+            # Обновить Google Sheets для ОБОИХ новых мастеров
+            for booking in bookings_to_change:
+                await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
+
+            # Логировать перенос
+            for i, booking in enumerate(bookings_to_change):
+                try:
+                    transfer_data = {
+                        "old_date": old_data[i]["date"].strftime("%d.%m"),
+                        "old_full_date": old_data[i]["date"].strftime("%d.%m.%Y"),
+                        "old_time": str(old_data[i]["time"]),
+                        "new_date": new_date.strftime("%d.%m"),
+                        "new_time": str(new_time),
+                        "client_id": client_id,
+                        "client_name": booking.client_name or "Клиент",
+                        "service": f"{booking.service_name} (двойная запись)",
+                        "old_specialist": old_data[i]["specialist"],
+                        "new_specialist": booking.specialist_name
+                    }
+                    await self.sheets_service.log_transfer(transfer_data)
+                except Exception as log_error:
+                    logger.error(f"Message ID: {message_id} - Failed to log transfer: {log_error}")
 
             return {
                 "success": True,
-                "message": "",  # Убрали сообщение об изменении
-                "booking_id": old_booking.id
+                "message": f"Двойная запись перенесена: {specialist1} + {specialist2}",
+                "booking_ids": [b.id for b in bookings_to_change]
             }
-            
+
         except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error changing double booking: {e}")
             return {
                 "success": False,
-                "message": f"Ошибка при изменении записи: {str(e)}"
+                "message": f"Ошибка при переносе двойной записи: {str(e)}"
             }
     
     def _is_slot_available(self, specialist: str, booking_date: date, booking_time: time, duration_slots: int, exclude_booking_id: Optional[int] = None) -> bool:
@@ -780,4 +767,76 @@ class BookingService:
             "cancelled_bookings": cancelled_bookings,
             "specialists": self.project_config.specialists,
             "services": self.project_config.services
-        } 
+        }
+
+    async def _activate_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str,
+                                       contact_send_id: str = None) -> Dict[str, Any]:
+        """Активация двойной записи к двум мастерам"""
+        logger.info(f"Message ID: {message_id} - Activating DOUBLE booking for client_id={client_id}")
+
+        if not response.specialists_list or len(response.specialists_list) < 2:
+            return {"success": False, "message": "Недостаточно специалистов для двойной записи"}
+
+        specialist1, specialist2 = response.specialists_list[0], response.specialists_list[1]
+
+        # Проверить доступность ОБОИХ мастеров
+        booking_date = self._parse_date(response.date_order)
+        booking_time = self._parse_time(response.time_set_up)
+
+        # Проверка в Google Sheets для обоих мастеров
+        slot1_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist1, booking_date,
+                                                                                      booking_time)
+        slot2_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist2, booking_date,
+                                                                                      booking_time)
+
+        if not slot1_available or not slot2_available:
+            occupied_specialists = []
+            if not slot1_available:
+                occupied_specialists.append(specialist1)
+            if not slot2_available:
+                occupied_specialists.append(specialist2)
+            return {
+                "success": False,
+                "message": f"Мастер(а) {', '.join(occupied_specialists)} заняты на это время"
+            }
+
+        # Создать ДВЕ записи в БД
+        bookings = []
+        for specialist in [specialist1, specialist2]:
+            booking = Booking(
+                project_id=self.project_config.project_id,
+                specialist_name=specialist,
+                appointment_date=booking_date,
+                appointment_time=booking_time,
+                client_id=client_id,
+                client_name=response.name,
+                service_name=response.procedure,
+                client_phone=response.phone,
+                duration_minutes=60,  # Стандартная длительность
+                status="active"
+            )
+            self.db.add(booking)
+            bookings.append(booking)
+
+        self.db.commit()
+
+        # Обновить Google Sheets для ОБОИХ мастеров
+        for booking in bookings:
+            await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
+
+        # Добавить в Make.com таблицу
+        make_booking_data = {
+            'date': booking_date.strftime("%d.%m.%Y"),
+            'client_id': contact_send_id if contact_send_id else client_id,
+            'time': booking_time.strftime('%H:%M'),
+            'client_name': response.name or "Клиент",
+            'service': f"{response.procedure} (двойная запись)",
+            'specialist': f"{specialist1} + {specialist2}"
+        }
+        await self.sheets_service.add_booking_to_make_table_async(make_booking_data)
+
+        return {
+            "success": True,
+            "message": f"Двойная запись создана: {specialist1} + {specialist2}",
+            "booking_ids": [b.id for b in bookings]
+        }

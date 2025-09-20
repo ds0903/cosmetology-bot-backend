@@ -84,6 +84,10 @@ class ClaudeMainResponse(BaseModel):
     name: Optional[str] = Field(None, description="Client name")
     feedback: Optional[str] = Field(None, description="Client feedback")
 
+    cosmetolog_2: Optional[str] = Field(None, description="Second specialist name")
+    double_booking: Optional[bool] = Field(None, description="Is this a double booking")
+    specialists_list: Optional[List[str]] = Field(None, description="List of specialists for double booking")
+
 
 class BookingRecord(BaseModel):
     """Single booking record"""
