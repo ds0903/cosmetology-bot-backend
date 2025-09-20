@@ -92,7 +92,7 @@ config/secrets.yml
 secrets.json
 
 # Local configuration files
-local_config.json
+
 
 # Database files
 *.db
