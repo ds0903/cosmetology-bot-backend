@@ -594,15 +594,31 @@ class GoogleSheetsService:
             logger.warning(f"Cannot check reserved slots from sheets: no spreadsheet connection for {specialist_name}")
             return []
         
-        logger.debug(f"Reading reserved slots from Google Sheets for {specialist_name} on {target_date}")
+        logger.info(f"🔍 SHEETS DEBUG: Reading reserved slots from Google Sheets for {specialist_name} on {target_date}")
+        logger.info(f"🔍 SHEETS DEBUG: Spreadsheet title: {self.spreadsheet.title}")
+        logger.info(f"🔍 SHEETS DEBUG: Available worksheets: {[ws.title for ws in self.spreadsheet.worksheets()]}")
         
         try:
             # Get worksheet for specialist
             try:
                 worksheet = self.spreadsheet.worksheet(specialist_name)
+                logger.info(f"🔍 SHEETS DEBUG: Successfully found worksheet for {specialist_name}")
             except gspread.WorksheetNotFound:
-                logger.warning(f"Worksheet not found for specialist {specialist_name}")
-                return []
+                logger.warning(f"🔍 SHEETS DEBUG: Worksheet not found for specialist {specialist_name}")
+                # Попробуем найти лист с похожим именем
+                available_sheets = [ws.title for ws in self.spreadsheet.worksheets()]
+                logger.info(f"🔍 SHEETS DEBUG: Available sheets: {available_sheets}")
+                for sheet_name in available_sheets:
+                    if specialist_name.lower() in sheet_name.lower():
+                        logger.info(f"🔍 SHEETS DEBUG: Found similar sheet: {sheet_name}")
+                        try:
+                            worksheet = self.spreadsheet.worksheet(sheet_name)
+                            logger.info(f"🔍 SHEETS DEBUG: Using alternative worksheet: {sheet_name}")
+                            break
+                        except Exception as e:
+                            logger.error(f"🔍 SHEETS DEBUG: Error accessing alternative sheet {sheet_name}: {e}")
+                else:
+                    return []
             
             reserved_slots = []
             client_bookings_in_sheets = {}  # Добавить после reserved_slots = []
@@ -612,9 +628,14 @@ class GoogleSheetsService:
             try:
                 # Read all values in one batch call
                 all_values = worksheet.get_all_values()
-                logger.debug(f"Successfully retrieved {len(all_values)} rows from worksheet in batch")
+                logger.info(f"🔍 SHEETS DEBUG: Successfully retrieved {len(all_values)} rows from worksheet in batch")
+                logger.info(f"🔍 SHEETS DEBUG: First few rows: {all_values[:5] if all_values else 'No data'}")
                 
                 target_date_str = target_date.strftime("%d.%m.%Y")
+                logger.info(f"🔍 SHEETS DEBUG: Looking for date: {target_date_str}")
+                
+                found_target_date_rows = 0
+                occupied_slots_for_date = []
                 
                 # Process the data in memory instead of making individual API calls
                 for row_idx, row in enumerate(all_values[1:], start=2):  # Skip header row
@@ -628,6 +649,8 @@ class GoogleSheetsService:
                         
                         # Check if this row is for our target date
                         if date_val == target_date_str and time_val:
+                            found_target_date_rows += 1
+                            
                             # Собираем записи клиентов ТОЛЬКО для target_date
                             if client_id and self._has_content(client_id):
                                 if client_id not in client_bookings_in_sheets:
@@ -640,9 +663,23 @@ class GoogleSheetsService:
                                 })
                             
                             # Check if any booking column has content
-                            if any(self._has_content(cell) for cell in [client_id, client_name, service, phone]):
+                            has_content = any(self._has_content(cell) for cell in [client_id, client_name, service, phone])
+                            if has_content:
                                 reserved_slots.append(time_val)
-                                logger.debug(f"Found occupied slot in sheets: {time_val} (client_id: {client_id})")
+                                occupied_slots_for_date.append({
+                                    'time': time_val,
+                                    'client_id': client_id,
+                                    'client_name': client_name,
+                                    'service': service
+                                })
+                                logger.info(f"🔍 SHEETS DEBUG: Found occupied slot: {time_val} (client_id: {client_id}, name: {client_name}, service: {service})")
+                            else:
+                                logger.debug(f"🔍 SHEETS DEBUG: Free slot found: {time_val}")
+                                
+                logger.info(f"🔍 SHEETS DEBUG: Found {found_target_date_rows} rows for target date {target_date_str}")
+                logger.info(f"🔍 SHEETS DEBUG: Found {len(occupied_slots_for_date)} occupied slots for {specialist_name} on {target_date_str}")
+                if occupied_slots_for_date:
+                    logger.info(f"🔍 SHEETS DEBUG: Occupied slots details: {occupied_slots_for_date}")
                 
                 # Синхронизация с БД - добавить ПОСЛЕ цикла
                 from app.database import SessionLocal, Booking
@@ -678,7 +715,7 @@ class GoogleSheetsService:
                 # Fall back to empty list to prevent blocking
                 return []
             
-            logger.info(f"SHEETS DEBUG: Found {len(reserved_slots)} occupied slots from Google Sheets for {specialist_name}: {reserved_slots}")
+            logger.info(f"🔍 SHEETS DEBUG: FINAL RESULT: Found {len(reserved_slots)} occupied slots from Google Sheets for {specialist_name}: {reserved_slots}")
             
             if hasattr(self, 'db') and self.db:
                 from app.database import Booking
@@ -706,7 +743,7 @@ class GoogleSheetsService:
             return reserved_slots
             
         except Exception as e:
-            logger.error(f"Error reading reserved slots from sheets for {specialist_name}: {e}")
+            logger.error(f"🔍 SHEETS DEBUG: Error reading reserved slots from sheets for {specialist_name}: {e}", exc_info=True)
             return []
     
 

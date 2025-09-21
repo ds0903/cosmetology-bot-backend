@@ -178,8 +178,31 @@ class BookingService:
                 reserved_key = f'reserved_slots_{response.cosmetolog.lower()}'
                 
                 logger.info(f"Message ID: {message_id} - SLOT CHECK: Got current slots for {response.cosmetolog}")
-                logger.info(f"Message ID: {message_id} - Available slots: {current_slots.slots_by_specialist.get(specialist_key, [])}")
-                logger.info(f"Message ID: {message_id} - Reserved slots: {current_slots.reserved_slots_by_specialist.get(reserved_key, [])}")
+                logger.info(f"Message ID: {message_id} - SPECIALIST KEY: {specialist_key}")
+                logger.info(f"Message ID: {message_id} - RESERVED KEY: {reserved_key}")
+                
+                # DEBUG: Показать все доступные ключи
+                logger.info(f"Message ID: {message_id} - ALL AVAILABLE KEYS: {list(current_slots.slots_by_specialist.keys())}")
+                logger.info(f"Message ID: {message_id} - ALL RESERVED KEYS: {list(current_slots.reserved_slots_by_specialist.keys())}")
+                
+                available_slots = current_slots.slots_by_specialist.get(specialist_key, [])
+                reserved_slots = current_slots.reserved_slots_by_specialist.get(reserved_key, [])
+                
+                logger.info(f"Message ID: {message_id} - Available slots for {response.cosmetolog}: {available_slots}")
+                logger.info(f"Message ID: {message_id} - Reserved slots for {response.cosmetolog}: {reserved_slots}")
+                
+                # ИСПРАВЛЕНИЕ: Если нет слотов для специалиста, проверим другие варианты имени
+                if not available_slots and not reserved_slots:
+                    # Попробуем найти специалиста без учета регистра
+                    for key in current_slots.slots_by_specialist.keys():
+                        if response.cosmetolog.lower() in key.lower():
+                            logger.info(f"Message ID: {message_id} - Found alternative key: {key}")
+                            specialist_key = key
+                            reserved_key = key.replace('available_slots_', 'reserved_slots_')
+                            available_slots = current_slots.slots_by_specialist.get(specialist_key, [])
+                            reserved_slots = current_slots.reserved_slots_by_specialist.get(reserved_key, [])
+                            logger.info(f"Message ID: {message_id} - Using alternative - Available: {available_slots}, Reserved: {reserved_slots}")
+                            break
                 
                 # 2. Проверяем конкретное время
                 requested_time = booking_time.strftime("%H:%M")
@@ -192,19 +215,19 @@ class BookingService:
                 
                 logger.info(f"Message ID: {message_id} - Need to check {len(slots_to_check)} slots: {slots_to_check}")
                 
-                # 3. Проверка доступности ВСЕХ нужных слотов
-                available_slots = current_slots.slots_by_specialist.get(specialist_key, [])
-                reserved_slots = current_slots.reserved_slots_by_specialist.get(reserved_key, [])
-                
+                # 3. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Упрощенная проверка доступности
+                # Если нет зарезервированных слотов для этого времени - слот доступен
                 unavailable_slots = []
+                
                 for slot_time in slots_to_check:
-                    if slot_time not in available_slots:
-                        unavailable_slots.append(slot_time)
-                        logger.warning(f"Message ID: {message_id} - Slot {slot_time} NOT in available slots")
+                    # Проверяем только резервированные слоты
                     if slot_time in reserved_slots:
                         unavailable_slots.append(slot_time)
-                        logger.warning(f"Message ID: {message_id} - Slot {slot_time} IS in reserved slots")
+                        logger.warning(f"Message ID: {message_id} - ❌ Slot {slot_time} IS RESERVED")
+                    else:
+                        logger.info(f"Message ID: {message_id} - ✅ Slot {slot_time} is FREE")
                 
+                # НОВАЯ ЛОГИКА: Если слота нет в reserved_slots - он доступен
                 if unavailable_slots:
                     logger.error(f"Message ID: {message_id} - 🚨 BOOKING BLOCKED: Unavailable slots found: {unavailable_slots}")
                     return {
@@ -216,7 +239,7 @@ class BookingService:
                 logger.info(f"Message ID: {message_id} - ✅ ALL SLOTS AVAILABLE - proceeding with booking")
                 
             except Exception as e:
-                logger.error(f"Message ID: {message_id} - Error in atomic slot check: {e}, aborting booking")
+                logger.error(f"Message ID: {message_id} - Error in atomic slot check: {e}, aborting booking", exc_info=True)
                 return {
                     "success": False,
                     "message": "Ошибка проверки доступности",
@@ -632,24 +655,94 @@ class BookingService:
         return True
     
     def _parse_date(self, date_str: str) -> Optional[date]:
-        """Parse date string in various formats"""
+        """Parse date string in various formats with detailed logging"""
+        if not date_str:
+            logger.warning("Empty date string provided")
+            return None
+            
+        logger.info(f"PARSING DATE: Input string: '{date_str}'")
+        
         try:
+            # Clean the input string
+            date_str = str(date_str).strip()
+            logger.info(f"PARSING DATE: Cleaned string: '{date_str}'")
+            
             # Try DD.MM.YYYY format
             if len(date_str.split('.')) == 3:
-                return datetime.strptime(date_str, "%d.%m.%Y").date()
+                result = datetime.strptime(date_str, "%d.%m.%Y").date()
+                logger.info(f"PARSING DATE: Successfully parsed DD.MM.YYYY format: {result}")
+                return result
             # Try DD.MM format (assume current year)
             elif len(date_str.split('.')) == 2:
                 current_year = datetime.now().year
-                return datetime.strptime(f"{date_str}.{current_year}", "%d.%m.%Y").date()
-            return None
-        except Exception:
+                full_date_str = f"{date_str}.{current_year}"
+                result = datetime.strptime(full_date_str, "%d.%m.%Y").date()
+                logger.info(f"PARSING DATE: Successfully parsed DD.MM format with current year: {result}")
+                return result
+            # Try other formats
+            else:
+                # Try YYYY-MM-DD
+                try:
+                    result = datetime.strptime(date_str, "%Y-%m-%d").date()
+                    logger.info(f"PARSING DATE: Successfully parsed YYYY-MM-DD format: {result}")
+                    return result
+                except ValueError:
+                    pass
+                
+                # Try DD/MM/YYYY
+                try:
+                    result = datetime.strptime(date_str, "%d/%m/%Y").date()
+                    logger.info(f"PARSING DATE: Successfully parsed DD/MM/YYYY format: {result}")
+                    return result
+                except ValueError:
+                    pass
+                    
+                logger.error(f"PARSING DATE: Unrecognized date format: '{date_str}'")
+                return None
+        except Exception as e:
+            logger.error(f"PARSING DATE: Error parsing '{date_str}': {e}")
             return None
     
     def _parse_time(self, time_str: str) -> Optional[time]:
-        """Parse time string in HH:MM format"""
+        """Parse time string in HH:MM format with detailed logging"""
+        if not time_str:
+            logger.warning("Empty time string provided")
+            return None
+            
+        logger.info(f"PARSING TIME: Input string: '{time_str}'")
+        
         try:
-            return datetime.strptime(time_str, "%H:%M").time()
-        except Exception:
+            # Clean the input string
+            time_str = str(time_str).strip()
+            logger.info(f"PARSING TIME: Cleaned string: '{time_str}'")
+            
+            # Try HH:MM format
+            result = datetime.strptime(time_str, "%H:%M").time()
+            logger.info(f"PARSING TIME: Successfully parsed HH:MM format: {result}")
+            return result
+        except ValueError as e:
+            # Try alternative formats
+            try:
+                # Try H:MM format (single digit hour)
+                result = datetime.strptime(time_str, "%H:%M").time()
+                logger.info(f"PARSING TIME: Successfully parsed H:MM format: {result}")
+                return result
+            except ValueError:
+                pass
+                
+            try:
+                # Try HH.MM format
+                time_str_fixed = time_str.replace('.', ':')
+                result = datetime.strptime(time_str_fixed, "%H:%M").time()
+                logger.info(f"PARSING TIME: Successfully parsed HH.MM format: {result}")
+                return result
+            except ValueError:
+                pass
+                
+            logger.error(f"PARSING TIME: Unable to parse time '{time_str}': {e}")
+            return None
+        except Exception as e:
+            logger.error(f"PARSING TIME: Unexpected error parsing '{time_str}': {e}")
             return None
     
     def get_client_bookings(self, client_id: str) -> List[BookingRecord]:
@@ -832,6 +925,9 @@ class BookingService:
             requested_time = booking_time.strftime("%H:%M")
             occupied_specialists = []
             
+            logger.info(f"Message ID: {message_id} - DOUBLE BOOKING CHECK: All available keys: {list(current_slots.slots_by_specialist.keys())}")
+            logger.info(f"Message ID: {message_id} - DOUBLE BOOKING CHECK: All reserved keys: {list(current_slots.reserved_slots_by_specialist.keys())}")
+            
             # Проверяем каждого мастера
             for specialist in [specialist1, specialist2]:
                 specialist_key = f'available_slots_{specialist.lower()}'
@@ -840,12 +936,26 @@ class BookingService:
                 available_slots = current_slots.slots_by_specialist.get(specialist_key, [])
                 reserved_slots = current_slots.reserved_slots_by_specialist.get(reserved_key, [])
                 
+                # ИСПРАВЛЕНИЕ: Если нет слотов для специалиста, попробуем найти альтернативный ключ
+                if not available_slots and not reserved_slots:
+                    for key in current_slots.slots_by_specialist.keys():
+                        if specialist.lower() in key.lower():
+                            logger.info(f"Message ID: {message_id} - Found alternative key for {specialist}: {key}")
+                            specialist_key = key
+                            reserved_key = key.replace('available_slots_', 'reserved_slots_')
+                            available_slots = current_slots.slots_by_specialist.get(specialist_key, [])
+                            reserved_slots = current_slots.reserved_slots_by_specialist.get(reserved_key, [])
+                            break
+                
                 logger.info(f"Message ID: {message_id} - {specialist} available: {available_slots}")
                 logger.info(f"Message ID: {message_id} - {specialist} reserved: {reserved_slots}")
                 
-                if requested_time not in available_slots or requested_time in reserved_slots:
+                # ИСПРАВЛЕНИЕ: Упрощенная логика - проверяем только reserved_slots
+                if requested_time in reserved_slots:
                     occupied_specialists.append(specialist)
-                    logger.warning(f"Message ID: {message_id} - {specialist} NOT available at {requested_time}")
+                    logger.warning(f"Message ID: {message_id} - ❌ {specialist} NOT available at {requested_time} (slot is reserved)")
+                else:
+                    logger.info(f"Message ID: {message_id} - ✅ {specialist} available at {requested_time}")
             
             if occupied_specialists:
                 logger.error(f"Message ID: {message_id} - 🚨 DOUBLE BOOKING BLOCKED: Specialists unavailable: {occupied_specialists}")
@@ -857,7 +967,7 @@ class BookingService:
             logger.info(f"Message ID: {message_id} - ✅ BOTH SPECIALISTS AVAILABLE - proceeding with double booking")
             
         except Exception as e:
-            logger.error(f"Message ID: {message_id} - Error in double booking slot check: {e}")
+            logger.error(f"Message ID: {message_id} - Error in double booking slot check: {e}", exc_info=True)
             return {
                 "success": False,
                 "message": "Ошибка проверки доступности"
