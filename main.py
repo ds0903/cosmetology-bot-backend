@@ -783,6 +783,14 @@ async def process_message_async(project_id: str, client_id: str, queue_item_id: 
                             for specialist, specialist_reserved in reserved_slots.items():
                                 logger.info(f"Message ID: {message_id} - Specialist {specialist}: {len(specialist_reserved)} reserved slots: {specialist_reserved}")
                             logger.info(f"Message ID: {message_id} - IMPORTANT: These slots are FOR DATE: {slots_target_date}, checked on: {slots.date_of_checking}")
+
+                            for specialist_key, slots_list in available_slots.items():
+                                if isinstance(slots_list, list) and len(slots_list) > 0:
+                                    specialist_name = specialist_key.replace('available_slots_', '').title()
+                                    logger.info(f"Message ID: {message_id} - 🔧 CLAUDE SEES: {specialist_name} has {len(slots_list)} available slots: {slots_list[:5]}{'...' if len(slots_list) > 5 else ''}")
+                                else:
+                                    specialist_name = specialist_key.replace('available_slots_', '').title() if specialist_key else 'Unknown'
+                                    logger.warning(f"Message ID: {message_id} - 🔧 CLAUDE SEES: {specialist_name} has NO available slots")
                         else:
                             logger.warning(f"Message ID: {message_id} - No available slots returned from slot fetching task")
                             slots_target_date = "no_slots"

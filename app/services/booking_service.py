@@ -70,7 +70,7 @@ class BookingService:
     
     async def _activate_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str, contact_send_id: str = None) -> Dict[str, Any]:
         """Activate a new booking"""
-        logger.info(f"Message ID: {message_id} - Activating booking for client_id={client_id}")
+        logger.info(f"Message ID: {message_id} - 🔧 IMPROVED: Activating booking for client_id={client_id}")
         logger.info(f"DEBUG START: _activate_booking called with contact_send_id={contact_send_id}")
         
         try:
@@ -151,43 +151,22 @@ class BookingService:
                     logger.warning(f"Message ID: {message_id} - Using default duration: 1 slot (30 minutes)")
             else:
                 logger.warning(f"Message ID: {message_id} - No service specified, using default duration: 1 slot (30 minutes)")
+
+            logger.info(f"Message ID: {message_id} - 🔧 STARTING ATOMIC SLOT CHECK + BOOKING")
+            logger.info(f"Message ID: {message_id} - Checking specialist={response.cosmetolog}, date={booking_date}, time={booking_time}, duration={duration_slots}")
             
-            # Check if time slot is available (double-check both database and Google Sheets)
-            logger.debug(f"Message ID: {message_id} - Checking slot availability: specialist={response.cosmetolog}, date={booking_date}, time={booking_time}, duration={duration_slots}")
-            
-            # FIRST check Google Sheets as primary source
             try:
-                if not await self.sheets_service.is_slot_available_in_sheets_async(response.cosmetolog, booking_date, booking_time):
-                    logger.warning(f"Message ID: {message_id} - Time slot not available in Google Sheets: specialist={response.cosmetolog}, date={booking_date}, time={booking_time}")
-                    return {
-                        "success": False,
-                        "message": "Выбранное время уже занято"
-                    }
-            except Exception as sheets_check_error:
-                logger.error(f"Message ID: {message_id} - Could not verify slot availability in Google Sheets: {sheets_check_error}")
-                # CRITICAL: Do not allow booking if we can't verify sheets availability
-                return {
-                    "success": False,
-                    "message": "Ошибка проверки доступности времени"
-                }
-            
-            # Then check database as secondary validation
-            if not self._is_slot_available(response.cosmetolog, booking_date, booking_time, duration_slots):
-                logger.warning(f"Message ID: {message_id} - Time slot not available in database: specialist={response.cosmetolog}, date={booking_date}, time={booking_time}")
-                # Don't block if DB says busy but Sheets says free
-                logger.info(f"Message ID: {message_id} - Continuing despite DB conflict - Google Sheets is primary source")
-            
-            # Create booking
-            end_time = datetime.combine(booking_date, booking_time) + timedelta(minutes=30 * duration_slots)
-            logger.info(f"Message ID: {message_id} - Creating new booking: client_id={client_id}, specialist={response.cosmetolog}")
-            logger.info(f"Message ID: {message_id} -   Service: {normalized_service} ({duration_slots} slots)")
-            logger.info(f"Message ID: {message_id} -   Time: {booking_date} {booking_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}")
-            
-            # ФИНАЛЬНАЯ ПРОВЕРКА КОЛЛИЗИЙ (добавить перед booking = Booking)
-            # Проверяем слот еще раз непосредственно перед записью
-            try:
-                final_check = await self.sheets_service.get_available_slots_async(self.db, booking_date, duration_slots)
-                reserved_key = f'reserved_slots_{response.cosmetolog}'
+                # 1. Получаем текущее состояние слотов
+                current_slots = await self.sheets_service.get_available_slots_async(self.db, booking_date, duration_slots)
+                specialist_key = f'available_slots_{response.cosmetolog.lower()}'
+                reserved_key = f'reserved_slots_{response.cosmetolog.lower()}'
+                
+                logger.info(f"Message ID: {message_id} - SLOT CHECK: Got current slots for {response.cosmetolog}")
+                logger.info(f"Message ID: {message_id} - Available slots: {current_slots.slots_by_specialist.get(specialist_key, [])}")
+                logger.info(f"Message ID: {message_id} - Reserved slots: {current_slots.reserved_slots_by_specialist.get(reserved_key, [])}")
+                
+                # 2. Проверяем конкретное время
+                requested_time = booking_time.strftime("%H:%M")
                 
                 # Проверяем все слоты, которые займет эта запись
                 slots_to_check = []
@@ -195,28 +174,45 @@ class BookingService:
                     check_time = (datetime.combine(booking_date, booking_time) + timedelta(minutes=30*i)).time()
                     slots_to_check.append(check_time.strftime("%H:%M"))
                 
-                # Если хоть один слот занят - блокируем запись
-                if reserved_key in final_check:
-                    for slot in slots_to_check:
-                        if slot in final_check[reserved_key]:
-                            logger.error(f"Message ID: {message_id} - COLLISION! Slot {slot} became occupied during booking!")
-                            return {
-                                "success": False,
-                                "message": "ОШИБКА! СЛОТ ОКАЗАЛСЯ ЗАНЯТ",
-                                "record_error": "ОШИБКА! СЛОТ ОКАЗАЛСЯ ЗАНЯТ"
-                            }
+                logger.info(f"Message ID: {message_id} - Need to check {len(slots_to_check)} slots: {slots_to_check}")
                 
-                logger.info(f"Message ID: {message_id} - Final collision check passed for {len(slots_to_check)} slots")
+                # 3. Проверка доступности ВСЕХ нужных слотов
+                available_slots = current_slots.slots_by_specialist.get(specialist_key, [])
+                reserved_slots = current_slots.reserved_slots_by_specialist.get(reserved_key, [])
+                
+                unavailable_slots = []
+                for slot_time in slots_to_check:
+                    if slot_time not in available_slots:
+                        unavailable_slots.append(slot_time)
+                        logger.warning(f"Message ID: {message_id} - Slot {slot_time} NOT in available slots")
+                    if slot_time in reserved_slots:
+                        unavailable_slots.append(slot_time)
+                        logger.warning(f"Message ID: {message_id} - Slot {slot_time} IS in reserved slots")
+                
+                if unavailable_slots:
+                    logger.error(f"Message ID: {message_id} - 🚨 BOOKING BLOCKED: Unavailable slots found: {unavailable_slots}")
+                    return {
+                        "success": False,
+                        "message": f"Время {', '.join(unavailable_slots)} уже занято",
+                        "record_error": f"Слоты недоступны: {', '.join(unavailable_slots)}"
+                    }
+                
+                logger.info(f"Message ID: {message_id} - ✅ ALL SLOTS AVAILABLE - proceeding with booking")
                 
             except Exception as e:
-                logger.error(f"Message ID: {message_id} - Final check failed: {e}, aborting booking")
+                logger.error(f"Message ID: {message_id} - Error in atomic slot check: {e}, aborting booking")
                 return {
                     "success": False,
                     "message": "Ошибка проверки доступности",
-                    "record_error": "Ошибка проверки доступности"
+                    "record_error": f"Ошибка проверки: {str(e)}"
                 }
             
-
+            # 4. СОЗДАЕМ ЗАПИСЬ (только если все проверки прошли)
+            end_time = datetime.combine(booking_date, booking_time) + timedelta(minutes=30 * duration_slots)
+            logger.info(f"Message ID: {message_id} - Creating new booking: client_id={client_id}, specialist={response.cosmetolog}")
+            logger.info(f"Message ID: {message_id} -   Service: {normalized_service} ({duration_slots} slots)")
+            logger.info(f"Message ID: {message_id} -   Time: {booking_date} {booking_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}")
+            
             booking = Booking(
                 project_id=self.project_config.project_id,
                 specialist_name=response.cosmetolog,
@@ -234,7 +230,19 @@ class BookingService:
             self.db.commit()
             self.db.refresh(booking)
             
-            logger.info(f"Message ID: {message_id} - Booking created successfully: booking_id={booking.id}, client_id={client_id}")
+            logger.info(f"Message ID: {message_id} - ✅ Booking created successfully: booking_id={booking.id}")
+            
+            # 5. Обновляем Google Sheets сразу после создания записи
+            try:
+                logger.debug(f"Message ID: {message_id} - Updating Google Sheets for booking {booking.id}")
+                sheets_success = await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
+                if sheets_success:
+                    logger.info(f"Message ID: {message_id} - ✅ Google Sheets updated successfully")
+                else:
+                    logger.warning(f"Message ID: {message_id} - ⚠️ Google Sheets update returned false")
+            except Exception as sheets_error:
+                logger.error(f"Message ID: {message_id} - ❌ Failed to update Google Sheets: {sheets_error}")
+                # Don't fail the booking for sheets sync issues
             # Экспортируем диалог на Google Drive
             try:
                 from app.database import SessionLocal, Dialogue
@@ -290,17 +298,7 @@ class BookingService:
                 logger.error(f"Message ID: {message_id} - Failed to add to Make.com table: {make_error}")
                 # Don't fail the booking if Make.com table update fails 
 
-            # Update Google Sheets - targeted update for this specific booking (async)
-            try:
-                logger.debug(f"Message ID: {message_id} - Updating specific booking slot {booking.id} in Google Sheets")
-                sheets_success = await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
-                if sheets_success:
-                    logger.debug(f"Message ID: {message_id} - Google Sheets slot update completed successfully")
-                else:
-                    logger.warning(f"Message ID: {message_id} - Google Sheets slot update returned false")
-            except Exception as sheets_error:
-                logger.error(f"Message ID: {message_id} - Failed to update booking slot in Google Sheets: {sheets_error}")
-                # Don't fail the booking for sheets sync issues
+            # 🔧 ИСПРАВЛЕНО: Google Sheets уже обновлены выше (пункт 5)
             
             return {
                 "success": True,
