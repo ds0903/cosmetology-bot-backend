@@ -73,14 +73,30 @@ class BookingService:
         logger.info(f"Message ID: {message_id} - 🔧 IMPROVED: Activating booking for client_id={client_id}")
         logger.info(f"DEBUG START: _activate_booking called with contact_send_id={contact_send_id}")
         
+        # ИСПРАВЛЕНИЕ: Добавляем детальное логирование типа записи
+        logger.info(f"Message ID: {message_id} - Checking booking type: double_booking={response.double_booking}, specialists_list={response.specialists_list}")
+        logger.info(f"Message ID: {message_id} - Single booking fields: cosmetolog={response.cosmetolog}, date={response.date_order}, time={response.time_set_up}")
+        
         try:
-            # Validate required fields
-            if not response.cosmetolog or not response.date_order or not response.time_set_up:
-                logger.warning(f"Message ID: {message_id} - Missing required booking fields for client_id={client_id}: specialist={response.cosmetolog}, date={response.date_order}, time={response.time_set_up}")
-                return {
-                    "success": False,
-                    "message": "Недостаточно данных для создания записи"
-                }
+            if response.double_booking and response.specialists_list:
+                # Для двойной записи проверяем specialists_list
+                if not response.specialists_list or len(response.specialists_list) < 2 or not response.date_order or not response.time_set_up:
+                    logger.warning(f"Message ID: {message_id} - Missing required fields for DOUBLE booking for client_id={client_id}: specialists={response.specialists_list}, date={response.date_order}, time={response.time_set_up}")
+                    return {
+                        "success": False,
+                        "message": "Недостаточно данных для создания двойной записи"
+                    }
+                logger.info(f"Message ID: {message_id} - DOUBLE booking detected, redirecting to _activate_double_booking")
+                # Перенаправляем на метод двойной записи
+                return await self._activate_double_booking(response, client_id, message_id, contact_send_id)
+            else:
+                # Для одинарной записи проверяем cosmetolog
+                if not response.cosmetolog or not response.date_order or not response.time_set_up:
+                    logger.warning(f"Message ID: {message_id} - Missing required fields for SINGLE booking for client_id={client_id}: specialist={response.cosmetolog}, date={response.date_order}, time={response.time_set_up}")
+                    return {
+                        "success": False,
+                        "message": "Недостаточно данных для создания записи"
+                    }
             
             # Parse date and time
             try:
@@ -769,69 +785,156 @@ class BookingService:
 
     async def _activate_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str,
                                        contact_send_id: str = None) -> Dict[str, Any]:
-        """Активация двойной записи к двум мастерам"""
-        logger.info(f"Message ID: {message_id} - Activating DOUBLE booking for client_id={client_id}")
+        """ИСПРАВЛЕННАЯ активация двойной записи к двум мастерам"""
+        logger.info(f"Message ID: {message_id} - 🔧 IMPROVED: Activating DOUBLE booking for client_id={client_id}")
+        logger.info(f"Message ID: {message_id} - Double booking fields: specialists={response.specialists_list}, date={response.date_order}, time={response.time_set_up}")
 
+        # ИСПРАВЛЕНИЕ: Детальная проверка полей
         if not response.specialists_list or len(response.specialists_list) < 2:
+            logger.warning(f"Message ID: {message_id} - Invalid specialists_list for double booking: {response.specialists_list}")
             return {"success": False, "message": "Недостаточно специалистов для двойной записи"}
+        
+        if not response.date_order or not response.time_set_up:
+            logger.warning(f"Message ID: {message_id} - Missing date/time for double booking: date={response.date_order}, time={response.time_set_up}")
+            return {"success": False, "message": "Недостаточно данных для двойной записи"}
 
         specialist1, specialist2 = response.specialists_list[0], response.specialists_list[1]
-
-        # Проверить доступность ОБОИХ мастеров
+        logger.info(f"Message ID: {message_id} - Double booking specialists: {specialist1} + {specialist2}")
+        
+        # ИСПРАВЛЕНИЕ: Используем улучшенную валидацию даты и времени
         booking_date = self._parse_date(response.date_order)
         booking_time = self._parse_time(response.time_set_up)
-
-        # Проверка в Google Sheets для обоих мастеров
-        slot1_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist1, booking_date,
-                                                                                      booking_time)
-        slot2_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist2, booking_date,
-                                                                                      booking_time)
-
-        if not slot1_available or not slot2_available:
-            occupied_specialists = []
-            if not slot1_available:
-                occupied_specialists.append(specialist1)
-            if not slot2_available:
-                occupied_specialists.append(specialist2)
+        
+        if not booking_date or not booking_time:
+            logger.warning(f"Message ID: {message_id} - Invalid date/time format: date={response.date_order}, time={response.time_set_up}")
             return {
                 "success": False,
-                "message": f"Мастер(а) {', '.join(occupied_specialists)} заняты на это время"
+                "message": "Неверный формат даты или времени"
+            }
+        
+        # Проверить что оба специалиста существуют
+        for specialist in [specialist1, specialist2]:
+            if specialist not in self.project_config.specialists:
+                logger.warning(f"Message ID: {message_id} - Unknown specialist: {specialist}, available: {self.project_config.specialists}")
+                return {
+                    "success": False,
+                    "message": f"Специалист {specialist} не найден"
+                }
+        
+        logger.info(f"Message ID: {message_id} - 🔧 STARTING ATOMIC DOUBLE BOOKING CHECK")
+        logger.info(f"Message ID: {message_id} - Checking {specialist1} and {specialist2} for {booking_date} {booking_time}")
+        
+        try:
+            # Получаем текущее состояние слотов для ОБОИХ мастеров
+            duration_slots = 2  # Стандартная длительность для двойной записи
+            current_slots = await self.sheets_service.get_available_slots_async(self.db, booking_date, duration_slots)
+            
+            requested_time = booking_time.strftime("%H:%M")
+            occupied_specialists = []
+            
+            # Проверяем каждого мастера
+            for specialist in [specialist1, specialist2]:
+                specialist_key = f'available_slots_{specialist.lower()}'
+                reserved_key = f'reserved_slots_{specialist.lower()}'
+                
+                available_slots = current_slots.slots_by_specialist.get(specialist_key, [])
+                reserved_slots = current_slots.reserved_slots_by_specialist.get(reserved_key, [])
+                
+                logger.info(f"Message ID: {message_id} - {specialist} available: {available_slots}")
+                logger.info(f"Message ID: {message_id} - {specialist} reserved: {reserved_slots}")
+                
+                if requested_time not in available_slots or requested_time in reserved_slots:
+                    occupied_specialists.append(specialist)
+                    logger.warning(f"Message ID: {message_id} - {specialist} NOT available at {requested_time}")
+            
+            if occupied_specialists:
+                logger.error(f"Message ID: {message_id} - 🚨 DOUBLE BOOKING BLOCKED: Specialists unavailable: {occupied_specialists}")
+                return {
+                    "success": False,
+                    "message": f"Мастер(а) {', '.join(occupied_specialists)} заняты на это время"
+                }
+            
+            logger.info(f"Message ID: {message_id} - ✅ BOTH SPECIALISTS AVAILABLE - proceeding with double booking")
+            
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error in double booking slot check: {e}")
+            return {
+                "success": False,
+                "message": "Ошибка проверки доступности"
             }
 
-        # Создать ДВЕ записи в БД
+        # ИСПРАВЛЕНИЕ: Создать ДВЕ записи в БД с улучшенным логированием
+        logger.info(f"Message ID: {message_id} - Creating DOUBLE booking records in database")
         bookings = []
-        for specialist in [specialist1, specialist2]:
-            booking = Booking(
-                project_id=self.project_config.project_id,
-                specialist_name=specialist,
-                appointment_date=booking_date,
-                appointment_time=booking_time,
-                client_id=client_id,
-                client_name=response.name,
-                service_name=response.procedure,
-                client_phone=response.phone,
-                duration_minutes=60,  # Стандартная длительность
-                status="active"
-            )
-            self.db.add(booking)
-            bookings.append(booking)
+        
+        try:
+            for i, specialist in enumerate([specialist1, specialist2]):
+                logger.info(f"Message ID: {message_id} - Creating booking {i+1}/2 for {specialist}")
+                booking = Booking(
+                    project_id=self.project_config.project_id,
+                    specialist_name=specialist,
+                    appointment_date=booking_date,
+                    appointment_time=booking_time,
+                    client_id=client_id,
+                    client_name=response.name,
+                    service_name=response.procedure,
+                    client_phone=response.phone,
+                    duration_minutes=60,  # Стандартная длительность
+                    status="active"
+                )
+                self.db.add(booking)
+                bookings.append(booking)
+            
+            self.db.commit()
+            
+            # Обновляем ID после commit
+            for booking in bookings:
+                self.db.refresh(booking)
+                logger.info(f"Message ID: {message_id} - ✅ Booking created: ID={booking.id}, specialist={booking.specialist_name}")
+            
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error creating double booking records: {e}")
+            self.db.rollback()
+            return {
+                "success": False,
+                "message": f"Ошибка при создании записи: {str(e)}"
+            }
 
-        self.db.commit()
-
-        # Обновить Google Sheets для ОБОИХ мастеров
-        for booking in bookings:
-            await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
-
-        # Добавить в Make.com таблицу
-        make_booking_data = {
-            'date': booking_date.strftime("%d.%m.%Y"),
-            'client_id': contact_send_id if contact_send_id else client_id,
-            'time': booking_time.strftime('%H:%M'),
-            'client_name': response.name or "Клиент",
-            'service': f"{response.procedure} (двойная запись)",
-            'specialist': f"{specialist1} + {specialist2}"
-        }
-        await self.sheets_service.add_booking_to_make_table_async(make_booking_data)
+        # ИСПРАВЛЕНИЕ: Обновить Google Sheets для ОБОИХ мастеров с обработкой ошибок
+        logger.info(f"Message ID: {message_id} - Updating Google Sheets for both specialists")
+        sheets_success_count = 0
+        
+        for i, booking in enumerate(bookings):
+            try:
+                logger.debug(f"Message ID: {message_id} - Updating Google Sheets for {booking.specialist_name} (booking {i+1}/2)")
+                sheets_success = await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
+                if sheets_success:
+                    sheets_success_count += 1
+                    logger.info(f"Message ID: {message_id} - ✅ Google Sheets updated for {booking.specialist_name}")
+                else:
+                    logger.warning(f"Message ID: {message_id} - ⚠️ Google Sheets update failed for {booking.specialist_name}")
+            except Exception as sheets_error:
+                logger.error(f"Message ID: {message_id} - ❌ Failed to update Google Sheets for {booking.specialist_name}: {sheets_error}")
+        
+        logger.info(f"Message ID: {message_id} - Google Sheets updates completed: {sheets_success_count}/2 successful")
+        
+        # ИСПРАВЛЕНИЕ: Добавить в Make.com таблицу с обработкой ошибок
+        try:
+            make_booking_data = {
+                'date': booking_date.strftime("%d.%m.%Y"),
+                'client_id': contact_send_id if contact_send_id else client_id,
+                'messenger_client_id': client_id,  # Добавляем Messenger ID
+                'time': booking_time.strftime('%H:%M'),
+                'client_name': response.name or "Клиент",
+                'service': f"{response.procedure or 'Услуга'} (двойная запись)",
+                'specialist': f"{specialist1} + {specialist2}"
+            }
+            logger.info(f"Message ID: {message_id} - Adding double booking to Make.com table")
+            await self.sheets_service.add_booking_to_make_table_async(make_booking_data)
+            logger.info(f"Message ID: {message_id} - ✅ Double booking added to Make.com table for 24h reminders")
+        except Exception as make_error:
+            logger.error(f"Message ID: {message_id} - ❌ Failed to add double booking to Make.com table: {make_error}")
+            # Не прерываем процесс если Make.com не удалось
 
         return {
             "success": True,
