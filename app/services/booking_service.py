@@ -785,11 +785,11 @@ class BookingService:
 
     async def _activate_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str,
                                        contact_send_id: str = None) -> Dict[str, Any]:
-        """ИСПРАВЛЕННАЯ активация двойной записи к двум мастерам"""
-        logger.info(f"Message ID: {message_id} - 🔧 IMPROVED: Activating DOUBLE booking for client_id={client_id}")
+        """ИСПРАВЛЕННАЯ активация двойной записи с поддержкой разного времени для каждого мастера"""
+        logger.info(f"Message ID: {message_id} - 🔧 FIXED: Activating DOUBLE booking for client_id={client_id}")
         logger.info(f"Message ID: {message_id} - Double booking fields: specialists={response.specialists_list}, date={response.date_order}, time={response.time_set_up}")
 
-        # ИСПРАВЛЕНИЕ: Детальная проверка полей
+        # Проверка полей
         if not response.specialists_list or len(response.specialists_list) < 2:
             logger.warning(f"Message ID: {message_id} - Invalid specialists_list for double booking: {response.specialists_list}")
             return {"success": False, "message": "Недостаточно специалистов для двойной записи"}
@@ -798,83 +798,90 @@ class BookingService:
             logger.warning(f"Message ID: {message_id} - Missing date/time for double booking: date={response.date_order}, time={response.time_set_up}")
             return {"success": False, "message": "Недостаточно данных для двойной записи"}
 
-        specialist1, specialist2 = response.specialists_list[0], response.specialists_list[1]
-        logger.info(f"Message ID: {message_id} - Double booking specialists: {specialist1} + {specialist2}")
+        # ИСПРАВЛЕНИЕ: Парсим информацию о времени для каждого мастера из gpt_response
+        specialist_times = self._parse_specialist_times_from_response(response.gpt_response, response.specialists_list, message_id)
         
-        # ИСПРАВЛЕНИЕ: Используем улучшенную валидацию даты и времени
-        booking_date = self._parse_date(response.date_order)
-        booking_time = self._parse_time(response.time_set_up)
+        logger.info(f"Message ID: {message_id} - Parsed specialist times: {specialist_times}")
         
-        if not booking_date or not booking_time:
-            logger.warning(f"Message ID: {message_id} - Invalid date/time format: date={response.date_order}, time={response.time_set_up}")
-            return {
-                "success": False,
-                "message": "Неверный формат даты или времени"
+        # Проверим что у нас есть время для каждого мастера
+        if len(specialist_times) != len(response.specialists_list):
+            logger.warning(f"Message ID: {message_id} - Could not parse times for all specialists. Using fallback method.")
+            # Фоллбэк: используем базовое время для первого мастера, +3 часа для второго
+            base_time = self._parse_time(response.time_set_up)
+            if not base_time:
+                return {"success": False, "message": "Неверный формат времени"}
+            
+            from datetime import datetime, timedelta
+            second_time = (datetime.combine(datetime.today(), base_time) + timedelta(hours=3)).time()
+            specialist_times = {
+                response.specialists_list[0]: base_time,
+                response.specialists_list[1]: second_time
             }
+            logger.info(f"Message ID: {message_id} - Fallback times assigned: {specialist_times}")
+
+        booking_date = self._parse_date(response.date_order)
+        if not booking_date:
+            logger.warning(f"Message ID: {message_id} - Invalid date format: {response.date_order}")
+            return {"success": False, "message": "Неверный формат даты"}
         
         # Проверить что оба специалиста существуют
-        for specialist in [specialist1, specialist2]:
+        for specialist in response.specialists_list:
             if specialist not in self.project_config.specialists:
-                logger.warning(f"Message ID: {message_id} - Unknown specialist: {specialist}, available: {self.project_config.specialists}")
-                return {
-                    "success": False,
-                    "message": f"Специалист {specialist} не найден"
-                }
+                logger.warning(f"Message ID: {message_id} - Unknown specialist: {specialist}")
+                return {"success": False, "message": f"Специалист {specialist} не найден"}
         
-        logger.info(f"Message ID: {message_id} - 🔧 STARTING ATOMIC DOUBLE BOOKING CHECK")
-        logger.info(f"Message ID: {message_id} - Checking {specialist1} and {specialist2} for {booking_date} {booking_time}")
+        logger.info(f"Message ID: {message_id} - 🔧 STARTING IMPROVED DOUBLE BOOKING CHECK")
         
         try:
-            # Получаем текущее состояние слотов для ОБОИХ мастеров
-            duration_slots = 2  # Стандартная длительность для двойной записи
-            current_slots = await self.sheets_service.get_available_slots_async(self.db, booking_date, duration_slots)
-            
-            requested_time = booking_time.strftime("%H:%M")
+            # Проверяем доступность каждого мастера в его конкретное время
+            duration_slots = 2  # Стандартная длительность
             occupied_specialists = []
             
-            # Проверяем каждого мастера
-            for specialist in [specialist1, specialist2]:
+            for specialist, booking_time in specialist_times.items():
+                # Проверяем доступность этого мастера в его время
+                current_slots = await self.sheets_service.get_available_slots_async(self.db, booking_date, duration_slots)
                 specialist_key = f'available_slots_{specialist.lower()}'
                 reserved_key = f'reserved_slots_{specialist.lower()}'
                 
                 available_slots = current_slots.slots_by_specialist.get(specialist_key, [])
                 reserved_slots = current_slots.reserved_slots_by_specialist.get(reserved_key, [])
                 
+                requested_time = booking_time.strftime("%H:%M")
+                
+                logger.info(f"Message ID: {message_id} - Checking {specialist} at {requested_time}")
                 logger.info(f"Message ID: {message_id} - {specialist} available: {available_slots}")
                 logger.info(f"Message ID: {message_id} - {specialist} reserved: {reserved_slots}")
                 
                 if requested_time not in available_slots or requested_time in reserved_slots:
-                    occupied_specialists.append(specialist)
+                    occupied_specialists.append(f"{specialist} ({requested_time})")
                     logger.warning(f"Message ID: {message_id} - {specialist} NOT available at {requested_time}")
             
             if occupied_specialists:
-                logger.error(f"Message ID: {message_id} - 🚨 DOUBLE BOOKING BLOCKED: Specialists unavailable: {occupied_specialists}")
+                logger.error(f"Message ID: {message_id} - 🚨 DOUBLE BOOKING BLOCKED: {occupied_specialists}")
                 return {
                     "success": False,
-                    "message": f"Мастер(а) {', '.join(occupied_specialists)} заняты на это время"
+                    "message": f"Время занято у: {', '.join(occupied_specialists)}"
                 }
             
-            logger.info(f"Message ID: {message_id} - ✅ BOTH SPECIALISTS AVAILABLE - proceeding with double booking")
+            logger.info(f"Message ID: {message_id} - ✅ ALL SPECIALISTS AVAILABLE at their respective times")
             
         except Exception as e:
             logger.error(f"Message ID: {message_id} - Error in double booking slot check: {e}")
-            return {
-                "success": False,
-                "message": "Ошибка проверки доступности"
-            }
+            return {"success": False, "message": "Ошибка проверки доступности"}
 
-        # ИСПРАВЛЕНИЕ: Создать ДВЕ записи в БД с улучшенным логированием
-        logger.info(f"Message ID: {message_id} - Creating DOUBLE booking records in database")
+        # ИСПРАВЛЕНИЕ: Создать записи с РАЗНЫМ временем для каждого мастера
+        logger.info(f"Message ID: {message_id} - Creating DOUBLE booking records with different times")
         bookings = []
         
         try:
-            for i, specialist in enumerate([specialist1, specialist2]):
-                logger.info(f"Message ID: {message_id} - Creating booking {i+1}/2 for {specialist}")
+            for i, (specialist, booking_time) in enumerate(specialist_times.items()):
+                logger.info(f"Message ID: {message_id} - Creating booking {i+1}/{len(specialist_times)} for {specialist} at {booking_time}")
+                
                 booking = Booking(
                     project_id=self.project_config.project_id,
                     specialist_name=specialist,
                     appointment_date=booking_date,
-                    appointment_time=booking_time,
+                    appointment_time=booking_time,  # ИСПРАВЛЕНО: используем разное время для каждого
                     client_id=client_id,
                     client_name=response.name,
                     service_name=response.procedure,
@@ -890,23 +897,20 @@ class BookingService:
             # Обновляем ID после commit
             for booking in bookings:
                 self.db.refresh(booking)
-                logger.info(f"Message ID: {message_id} - ✅ Booking created: ID={booking.id}, specialist={booking.specialist_name}")
+                logger.info(f"Message ID: {message_id} - ✅ Booking created: ID={booking.id}, specialist={booking.specialist_name}, time={booking.appointment_time}")
             
         except Exception as e:
             logger.error(f"Message ID: {message_id} - Error creating double booking records: {e}")
             self.db.rollback()
-            return {
-                "success": False,
-                "message": f"Ошибка при создании записи: {str(e)}"
-            }
+            return {"success": False, "message": f"Ошибка при создании записи: {str(e)}"}
 
-        # ИСПРАВЛЕНИЕ: Обновить Google Sheets для ОБОИХ мастеров с обработкой ошибок
-        logger.info(f"Message ID: {message_id} - Updating Google Sheets for both specialists")
+        # Обновить Google Sheets для КАЖДОГО мастера в его время
+        logger.info(f"Message ID: {message_id} - Updating Google Sheets for each specialist")
         sheets_success_count = 0
         
         for i, booking in enumerate(bookings):
             try:
-                logger.debug(f"Message ID: {message_id} - Updating Google Sheets for {booking.specialist_name} (booking {i+1}/2)")
+                logger.debug(f"Message ID: {message_id} - Updating sheets for {booking.specialist_name} at {booking.appointment_time}")
                 sheets_success = await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
                 if sheets_success:
                     sheets_success_count += 1
@@ -914,30 +918,89 @@ class BookingService:
                 else:
                     logger.warning(f"Message ID: {message_id} - ⚠️ Google Sheets update failed for {booking.specialist_name}")
             except Exception as sheets_error:
-                logger.error(f"Message ID: {message_id} - ❌ Failed to update Google Sheets for {booking.specialist_name}: {sheets_error}")
+                logger.error(f"Message ID: {message_id} - ❌ Failed to update sheets for {booking.specialist_name}: {sheets_error}")
         
-        logger.info(f"Message ID: {message_id} - Google Sheets updates completed: {sheets_success_count}/2 successful")
+        logger.info(f"Message ID: {message_id} - Google Sheets updates completed: {sheets_success_count}/{len(bookings)} successful")
         
-        # ИСПРАВЛЕНИЕ: Добавить в Make.com таблицу с обработкой ошибок
+        # Добавить в Make.com таблицу
         try:
+            specialist_names = " + ".join([booking.specialist_name for booking in bookings])
+            times_info = ", ".join([f"{b.specialist_name} {b.appointment_time}" for b in bookings])
+            
             make_booking_data = {
                 'date': booking_date.strftime("%d.%m.%Y"),
                 'client_id': contact_send_id if contact_send_id else client_id,
-                'messenger_client_id': client_id,  # Добавляем Messenger ID
-                'time': booking_time.strftime('%H:%M'),
+                'messenger_client_id': client_id,
+                'time': response.time_set_up,  # Базовое время для сортировки
                 'client_name': response.name or "Клиент",
-                'service': f"{response.procedure or 'Услуга'} (двойная запись)",
-                'specialist': f"{specialist1} + {specialist2}"
+                'service': f"{response.procedure or 'Услуги'} (двойная запись: {times_info})",
+                'specialist': specialist_names
             }
             logger.info(f"Message ID: {message_id} - Adding double booking to Make.com table")
             await self.sheets_service.add_booking_to_make_table_async(make_booking_data)
-            logger.info(f"Message ID: {message_id} - ✅ Double booking added to Make.com table for 24h reminders")
+            logger.info(f"Message ID: {message_id} - ✅ Double booking added to Make.com table")
         except Exception as make_error:
-            logger.error(f"Message ID: {message_id} - ❌ Failed to add double booking to Make.com table: {make_error}")
-            # Не прерываем процесс если Make.com не удалось
+            logger.error(f"Message ID: {message_id} - ❌ Failed to add to Make.com table: {make_error}")
 
         return {
             "success": True,
-            "message": f"Двойная запись создана: {specialist1} + {specialist2}",
+            "message": f"Двойная запись создана: {specialist_names}",
             "booking_ids": [b.id for b in bookings]
         }
+
+    def _parse_specialist_times_from_response(self, gpt_response: str, specialists_list: List[str], message_id: str) -> Dict[str, time]:
+        """
+        НОВЫЙ МЕТОД: Парсит время для каждого мастера из ответа Claude
+        Ищет паттерны типа "11:00 к Ольге", "14:00 к Анне"
+        """
+        specialist_times = {}
+        
+        try:
+            import re
+            # Паттерн для поиска времени и имени мастера
+            # Ищем: "время к/у имя", "время - имя", "имя время", "имя в время"
+            time_patterns = [
+                r'(\d{1,2}:\d{2})\s*(?:к|у|р|на|к|ж|д|к)\s*([А-ЯЁа-яё]+)',  # "11:00 к Ольге"
+                r'([А-ЯЁа-яё]+).*?(\d{1,2}:\d{2})',  # "Ольге 11:00" или "к Ольге на 11:00"
+                r'(\d{1,2}:\d{2})\s*[-–—]\s*([А-ЯЁа-яё]+)',  # "11:00 - Ольга"
+                r'([А-ЯЁа-яё]+)\s*[-–—]\s*(\d{1,2}:\d{2})'   # "Ольга - 11:00"
+            ]
+            
+            logger.info(f"Message ID: {message_id} - Parsing times from response: {gpt_response[:200]}...")
+            
+            for pattern in time_patterns:
+                matches = re.findall(pattern, gpt_response, re.IGNORECASE)
+                logger.debug(f"Message ID: {message_id} - Pattern '{pattern}' found matches: {matches}")
+                
+                for match in matches:
+                    if len(match) == 2:
+                        # Определяем что время, а что имя
+                        if re.match(r'\d{1,2}:\d{2}', match[0]):
+                            time_str, name = match[0], match[1]
+                        else:
+                            name, time_str = match[0], match[1]
+                        
+                        # Найти подходящего специалиста из списка
+                        matched_specialist = None
+                        name_clean = name.lower().strip()
+                        
+                        for specialist in specialists_list:
+                            if specialist.lower() in name_clean or name_clean in specialist.lower():
+                                matched_specialist = specialist
+                                break
+                        
+                        if matched_specialist:
+                            try:
+                                parsed_time = self._parse_time(time_str)
+                                if parsed_time:
+                                    specialist_times[matched_specialist] = parsed_time
+                                    logger.info(f"Message ID: {message_id} - Matched: {matched_specialist} -> {time_str}")
+                            except:
+                                continue
+            
+            logger.info(f"Message ID: {message_id} - Final parsed times: {specialist_times}")
+            return specialist_times
+            
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error parsing specialist times: {e}")
+            return {}
