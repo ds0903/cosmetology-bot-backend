@@ -804,6 +804,8 @@ class BookingService:
         
         logger.info(f"Message ID: {message_id} - Parsed specialist times: {specialist_times}")
         logger.info(f"Message ID: {message_id} - Parsed specialist procedures: {specialist_procedures}")
+        logger.info(f"Message ID: {message_id} - Original response.procedure: '{response.procedure}'")
+        logger.info(f"Message ID: {message_id} - Original gpt_response: '{response.gpt_response[:500]}...'")
         
         # Проверим что у нас есть время для каждого мастера
         if len(specialist_times) != len(response.specialists_list):
@@ -877,8 +879,25 @@ class BookingService:
         
         try:
             for i, (specialist, booking_time) in enumerate(specialist_times.items()):
-                # Получаем процедуру для этого конкретного мастера
-                specialist_procedure = specialist_procedures.get(specialist, response.procedure)
+                # ИСПРАВЛЕНО: Получаем процедуру для этого конкретного мастера БЕЗ fallback на общую процедуру
+                if specialist in specialist_procedures:
+                    specialist_procedure = specialist_procedures[specialist]
+                    logger.info(f"Message ID: {message_id} - ✅ Found parsed procedure for {specialist}: {specialist_procedure}")
+                else:
+                    # ИСПРАВЛЕНИЕ: Если не удалось распарсить - пробуем разделить общую процедуру пополам
+                    if response.procedure and ('+' in response.procedure or 'обертывание' in response.procedure.lower() or 'массаж' in response.procedure.lower()):
+                        # Попытка разделить процедуры
+                        procedures_parts = self._split_combined_procedure(response.procedure, response.specialists_list, message_id)
+                        if len(procedures_parts) >= len(response.specialists_list):
+                            specialist_procedure = procedures_parts[i] if i < len(procedures_parts) else procedures_parts[0]
+                            logger.info(f"Message ID: {message_id} - 🔄 Using split procedure for {specialist}: {specialist_procedure}")
+                        else:
+                            specialist_procedure = f"Процедура {i+1}"  # Fallback
+                            logger.warning(f"Message ID: {message_id} - ⚠️ Using fallback procedure for {specialist}: {specialist_procedure}")
+                    else:
+                        specialist_procedure = f"Процедура для {specialist}"  # Fallback
+                        logger.warning(f"Message ID: {message_id} - ⚠️ Using generic fallback for {specialist}: {specialist_procedure}")
+                
                 logger.info(f"Message ID: {message_id} - Creating booking {i+1}/{len(specialist_times)} for {specialist} at {booking_time} for procedure: {specialist_procedure}")
                 
                 booking = Booking(
@@ -1013,32 +1032,101 @@ class BookingService:
             logger.error(f"Message ID: {message_id} - Error parsing specialist times: {e}")
             return {}
     
+    def _split_combined_procedure(self, combined_procedure: str, specialists_list: List[str], message_id: str) -> List[str]:
+        """
+        НОВЫЙ МЕТОД: Разделяет объединенную процедуру на отдельные части для каждого мастера
+        """
+        try:
+            import re
+            
+            logger.info(f"Message ID: {message_id} - Splitting combined procedure: '{combined_procedure}'")
+            
+            # Удаляем лишние символы и нормализуем
+            clean_procedure = combined_procedure.strip().replace('  ', ' ')
+            
+            # Паттерны для разделения процедур
+            split_patterns = [
+                r'\s*\+\s*',  # "массаж + обертывание"
+                r'\s*,\s*',   # "массаж, обертывание"
+                r'\s*и\s*',   # "массаж и обертывание" 
+                r'\s*;\s*'    # "массаж; обертывание"
+            ]
+            
+            parts = [clean_procedure]  # Начинаем с полной строки
+            
+            # Пробуем разные паттерны разделения
+            for pattern in split_patterns:
+                new_parts = []
+                for part in parts:
+                    split_result = re.split(pattern, part)
+                    if len(split_result) > 1:
+                        new_parts.extend([p.strip() for p in split_result if p.strip()])
+                    else:
+                        new_parts.append(part)
+                parts = new_parts
+                
+                # Если получили достаточно частей - останавливаемся
+                if len(parts) >= len(specialists_list):
+                    break
+            
+            # Очищаем части от лишних слов
+            cleaned_parts = []
+            for part in parts:
+                # Убираем типичные вводные слова
+                clean_part = part.replace('разовое посещение', '').replace('посещение', '').strip()
+                if clean_part:
+                    cleaned_parts.append(clean_part)
+            
+            logger.info(f"Message ID: {message_id} - Split result: {cleaned_parts}")
+            
+            # Если не получилось разделить достаточно - дублируем или создаем вариации
+            while len(cleaned_parts) < len(specialists_list):
+                if len(cleaned_parts) == 1:
+                    # Если всего одна процедура - создаем вариации
+                    base_procedure = cleaned_parts[0]
+                    for i in range(len(specialists_list) - len(cleaned_parts)):
+                        cleaned_parts.append(f"{base_procedure} (вариант {i+2})")
+                else:
+                    # Если несколько - дублируем последнюю
+                    cleaned_parts.append(cleaned_parts[-1])
+            
+            return cleaned_parts[:len(specialists_list)]  # Возвращаем точно столько, сколько мастеров
+            
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error splitting procedure: {e}")
+            # Fallback: создаем простые названия
+            return [f"Процедура {i+1}" for i in range(len(specialists_list))]
+
     def _parse_specialist_procedures_from_response(self, gpt_response: str, specialists_list: List[str], message_id: str) -> Dict[str, str]:
         """
-        НОВЫЙ МЕТОД: Парсит процедуры для каждого мастера из ответа Claude
+        ПОКРАЩЕНИЙ МЕТОД: Парсит процедуры для каждого мастера из ответа Claude
         Ищет паттерны типа "к Ольге разовый массаж", "к Анне обертывание"
         """
         specialist_procedures = {}
         
         try:
             import re
-            # Паттерны для поиска процедур и имен мастеров
+            # Расширенные паттерны для поиска процедур и имен мастеров
             procedure_patterns = [
-                r'(?:к|у)\s*([А-ЯЁа-яё]+).*?(разовый массаж|обертывание|массаж|процедура|услуга|фибро[\w\s]*|стратосф[\w\s]*)',  # "к Ольге разовый массаж"
-                r'([А-ЯЁа-яё]+).*?[-–—]\s*(разовый массаж|обертывание|массаж|процедура|услуга|фибро[\w\s]*|стратосф[\w\s]*)',  # "Ольга - разовый массаж"
-                r'(разовый массаж|обертывание|массаж|процедура|услуга|фибро[\w\s]*|стратосф[\w\s]*).*?(?:к|у|для)\s*([А-ЯЁа-яё]+)',  # "разовый массаж к Ольге"
-                r'([А-ЯЁа-яё]+).*?(разовый\s*массаж|обертывание|массаж|фибро[\w\s]*|стратосф[\w\s]*)',  # "Ольге разовый массаж"
+                # Основные паттерны
+                r'(?:к|у)\s*([A-ЯЁа-яё]+).*?(разовый[\w\s]*массаж[\w\s]*|обертывание[\w\s]*|массаж[\w\s]*|фибро[\w\s-]*|стратосф[\w\s\u00e8\u00e9\u00e0\u00e2\u00e8]*|Stratosph[\w\s\u00e8\u00e9\u00e0\u00e2\u00e8]*)',  # "к Ольге разовый массаж"
+                r'([A-ЯЁа-яё]+).*?[-–—]\s*(разовый[\w\s]*массаж[\w\s]*|обертывание[\w\s]*|массаж[\w\s]*|фибро[\w\s-]*|стратосф[\w\s\u00e8\u00e9\u00e0\u00e2\u00e8]*|Stratosph[\w\s\u00e8\u00e9\u00e0\u00e2\u00e8]*)',  # "Ольга - разовый массаж"
+                
+                # Паттерн для строк с буллетами типа "• 11:00 к Ольге — Разовое посещение массажа Stratosphère"
+                r'\d{1,2}:\d{2}\s*к\s*([A-ЯЁа-яё]+).*?[—-]\s*([^\(\n]*?)(?:\s*\(|$)',
+                
+                # Дополнительные паттерны
+                r'(разовый[\w\s]*массаж[\w\s]*|обертывание[\w\s]*|массаж[\w\s]*|фибро[\w\s-]*|стратосф[\w\s\u00e8\u00e9\u00e0\u00e2\u00e8]*|Stratosph[\w\s\u00e8\u00e9\u00e0\u00e2\u00e8]*).*?(?:к|у|для)\s*([A-ЯЁа-яё]+)',  # "разовый массаж к Ольге"
             ]
             
-            logger.info(f"Message ID: {message_id} - Parsing procedures from response: {gpt_response[:300]}...")
+            logger.info(f"Message ID: {message_id} - Parsing procedures from response: {gpt_response[:400]}...")
             
-            for pattern in procedure_patterns:
-                matches = re.findall(pattern, gpt_response, re.IGNORECASE)
-                logger.debug(f"Message ID: {message_id} - Procedure pattern '{pattern}' found matches: {matches}")
+            for i, pattern in enumerate(procedure_patterns):
+                matches = re.findall(pattern, gpt_response, re.IGNORECASE | re.MULTILINE)
+                logger.debug(f"Message ID: {message_id} - Procedure pattern {i+1} found matches: {matches}")
                 
                 for match in matches:
                     if len(match) == 2:
-                        # Определяем что имя, а что процедура
                         name_candidate = match[0].strip()
                         procedure_candidate = match[1].strip()
                         
@@ -1049,8 +1137,11 @@ class BookingService:
                         for specialist in specialists_list:
                             if specialist.lower() in name_clean or name_clean in specialist.lower():
                                 matched_specialist = specialist
-                                specialist_procedures[matched_specialist] = procedure_candidate
-                                logger.info(f"Message ID: {message_id} - Matched procedure: {matched_specialist} -> {procedure_candidate}")
+                                # Очистим процедуру
+                                clean_procedure = self._clean_procedure_name(procedure_candidate)
+                                if clean_procedure and matched_specialist not in specialist_procedures:
+                                    specialist_procedures[matched_specialist] = clean_procedure
+                                    logger.info(f"Message ID: {message_id} - Matched procedure: {matched_specialist} -> {clean_procedure}")
                                 break
                         
                         # Если первое не имя мастера, попробуем наоборот
@@ -1061,27 +1152,11 @@ class BookingService:
                             for specialist in specialists_list:
                                 if specialist.lower() in name_clean or name_clean in specialist.lower():
                                     matched_specialist = specialist
-                                    specialist_procedures[matched_specialist] = procedure_candidate
-                                    logger.info(f"Message ID: {message_id} - Matched procedure (reversed): {matched_specialist} -> {procedure_candidate}")
+                                    clean_procedure = self._clean_procedure_name(procedure_candidate)
+                                    if clean_procedure and matched_specialist not in specialist_procedures:
+                                        specialist_procedures[matched_specialist] = clean_procedure
+                                        logger.info(f"Message ID: {message_id} - Matched procedure (reversed): {matched_specialist} -> {clean_procedure}")
                                     break
-            
-            # Попробуем также найти процедуры в структурированном тексте
-            # Ищем строки типа "• 11:00 к Ольге — Разовое посещение массажа Stratosphère (110 €)"
-            structured_pattern = r'([А-ЯЁа-яё]+)[^\n]*?[—-]\s*([^\n(]*?)(?:\s*\(|$)'
-            structured_matches = re.findall(structured_pattern, gpt_response, re.IGNORECASE | re.MULTILINE)
-            
-            for match in structured_matches:
-                name_candidate = match[0].strip()
-                procedure_text = match[1].strip()
-                
-                for specialist in specialists_list:
-                    if specialist.lower() in name_candidate.lower() or name_candidate.lower() in specialist.lower():
-                        # Очистим процедуру от лишнего текста
-                        clean_procedure = procedure_text.replace('Разовое посещение', '').replace('массажа', 'массаж').strip()
-                        if clean_procedure:
-                            specialist_procedures[specialist] = clean_procedure
-                            logger.info(f"Message ID: {message_id} - Matched structured procedure: {specialist} -> {clean_procedure}")
-                        break
             
             logger.info(f"Message ID: {message_id} - Final parsed procedures: {specialist_procedures}")
             return specialist_procedures
@@ -1089,3 +1164,20 @@ class BookingService:
         except Exception as e:
             logger.error(f"Message ID: {message_id} - Error parsing specialist procedures: {e}")
             return {}
+    
+    def _clean_procedure_name(self, procedure_text: str) -> str:
+        """
+        Очищает название процедуры от лишних слов
+        """
+        if not procedure_text:
+            return ""
+        
+        # Убираем лишние слова и символы
+        clean = procedure_text.strip()
+        clean = clean.replace('Разовое посещение', '')
+        clean = clean.replace('посещение', '')
+        clean = clean.replace('массажа', 'массаж')
+        clean = clean.replace('—', '').replace('–', '').replace('-', '')
+        clean = ' '.join(clean.split())  # Убираем лишние пробелы
+        
+        return clean.strip()
