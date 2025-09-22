@@ -346,11 +346,81 @@ class BookingService:
                 "message": f"Ошибка при отмене записи: {str(e)}"
             }
 
-    async def _reject_single_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
-        str, Any]:
-        """Reject/cancel a single booking"""
-        # Ваш существующий код _reject_booking переместить сюда
-        # ... (весь код из текущего _reject_booking)
+    async def _reject_single_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[str, Any]:
+        """Отменить одинарную запись"""
+        try:
+            # Parse date and time
+            booking_date = self._parse_date(response.date_reject)
+            booking_time = self._parse_time(response.time_reject)
+
+            if not booking_date or not booking_time:
+                return {
+                    "success": False,
+                    "message": "Неверный формат даты или времени"
+                }
+
+            # Find the booking to cancel
+            booking = self.db.query(Booking).filter(
+                and_(
+                    Booking.project_id == self.project_config.project_id,
+                    Booking.client_id == client_id,
+                    Booking.specialist_name == response.cosmetolog,
+                    Booking.appointment_date == booking_date,
+                    Booking.appointment_time == booking_time,
+                    Booking.status == "active"
+                )
+            ).first()
+
+            if not booking:
+                return {
+                    "success": False,
+                    "message": "Запись не найдена"
+                }
+
+            # Cancel booking
+            booking.status = "cancelled"
+            booking.updated_at = datetime.utcnow()
+            self.db.commit()
+
+            # Clear slot in Google Sheets
+            try:
+                duration_slots = booking.duration_minutes // 30
+                await self.sheets_service.clear_booking_slot_async(
+                    booking.specialist_name,
+                    booking.appointment_date,
+                    booking.appointment_time,
+                    duration_slots
+                )
+            except Exception as sheets_error:
+                logger.error(f"Message ID: {message_id} - Failed to clear booking slot: {sheets_error}")
+
+            # Log cancellation
+            try:
+                cancellation_data = {
+                    "date": booking.appointment_date.strftime("%d.%m"),
+                    "full_date": booking.appointment_date.strftime("%d.%m.%Y"),
+                    "time": str(booking.appointment_time),
+                    "client_id": client_id,
+                    "client_name": booking.client_name or "Клиент",
+                    "service": booking.service_name or "Услуга",
+                    "specialist": booking.specialist_name
+                }
+                await self.sheets_service.log_cancellation(cancellation_data)
+            except Exception as log_error:
+                logger.error(f"Message ID: {message_id} - Failed to log cancellation: {log_error}")
+
+            return {
+                "success": True,
+                "message": f"Запись отменена: {booking.specialist_name}",
+                "booking_id": booking.id
+            }
+
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error cancelling single booking: {e}")
+            return {
+                "success": False,
+                "message": f"Ошибка при отмене записи: {str(e)}"
+            }
 
     async def _reject_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
         str, Any]:
@@ -457,11 +527,252 @@ class BookingService:
                 "message": f"Ошибка при изменении записи: {str(e)}"
             }
 
-    async def _change_single_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
-        str, Any]:
-        """Change a single booking"""
-        # Ваш существующий код _change_booking переместить сюда
-        # ... (весь код из текущего _change_booking)
+    async def _change_single_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[str, Any]:
+        """Перенести одинарную запись (или автоматически найти все записи на старую дату)"""
+        try:
+            # Parse dates and times
+            old_date = self._parse_date(response.date_reject)
+            new_date = self._parse_date(response.date_order)
+
+            if not old_date or not new_date:
+                return {
+                    "success": False,
+                    "message": "Неверный формат даты"
+                }
+                
+            # ПОКРАЩЕНО: Проверяем, насколько записей у клиента на старую дату
+            all_bookings_on_old_date = self.db.query(Booking).filter(
+                and_(
+                    Booking.project_id == self.project_config.project_id,
+                    Booking.client_id == client_id,
+                    Booking.appointment_date == old_date,
+                    Booking.status == "active"
+                )
+            ).all()
+            
+            logger.info(f"Message ID: {message_id} - Found {len(all_bookings_on_old_date)} active bookings for client on {old_date}")
+            
+            # ОПТИМИЗАЦИЯ: Если на старой дате несколько записей - переносим все
+            if len(all_bookings_on_old_date) > 1:
+                logger.info(f"Message ID: {message_id} - Multiple bookings found, transferring ALL {len(all_bookings_on_old_date)} bookings to {new_date}")
+                return await self._transfer_multiple_bookings(all_bookings_on_old_date, new_date, response, client_id, message_id)
+            
+            # Одинарный перенос (как раньше)
+            old_time = self._parse_time(response.time_reject)
+            new_time = self._parse_time(response.time_set_up)
+
+            if not old_time or not new_time:
+                return {
+                    "success": False,
+                    "message": "Неверный формат времени"
+                }
+
+            # Find the specific booking to change
+            booking = self.db.query(Booking).filter(
+                and_(
+                    Booking.project_id == self.project_config.project_id,
+                    Booking.client_id == client_id,
+                    Booking.specialist_name == response.cosmetolog,
+                    Booking.appointment_date == old_date,
+                    Booking.appointment_time == old_time,
+                    Booking.status == "active"
+                )
+            ).first()
+
+            if not booking:
+                return {
+                    "success": False,
+                    "message": "Запись не найдена"
+                }
+
+            # Check if new slot is available
+            if not self._is_slot_available(response.cosmetolog, new_date, new_time, booking.duration_minutes // 30, booking.id):
+                return {
+                    "success": False,
+                    "message": f"Новое время уже занято"
+                }
+
+            # Save old data for logging
+            old_booking_data = {
+                "specialist": booking.specialist_name,
+                "date": booking.appointment_date,
+                "time": booking.appointment_time,
+                "duration_slots": booking.duration_minutes // 30
+            }
+
+            # Clear old slot
+            try:
+                await self.sheets_service.clear_booking_slot_async(
+                    booking.specialist_name,
+                    booking.appointment_date,
+                    booking.appointment_time,
+                    booking.duration_minutes // 30
+                )
+            except Exception as e:
+                logger.error(f"Message ID: {message_id} - Failed to clear old slot: {e}")
+
+            # Update booking
+            booking.specialist_name = response.cosmetolog
+            booking.appointment_date = new_date
+            booking.appointment_time = new_time
+            booking.client_name = response.name or booking.client_name
+            booking.service_name = response.procedure or booking.service_name
+            booking.client_phone = response.phone or booking.client_phone
+            booking.updated_at = datetime.utcnow()
+
+            self.db.commit()
+
+            # Update Google Sheets
+            await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
+
+            # Log the transfer
+            try:
+                transfer_data = {
+                    "old_date": old_booking_data["date"].strftime("%d.%m"),
+                    "old_full_date": old_booking_data["date"].strftime("%d.%m.%Y"),
+                    "old_time": str(old_booking_data["time"]),
+                    "new_date": new_date.strftime("%d.%m"),
+                    "new_time": str(new_time),
+                    "client_id": client_id,
+                    "client_name": booking.client_name or "Клиент",
+                    "service": booking.service_name or "Услуга",
+                    "old_specialist": old_booking_data["specialist"],
+                    "new_specialist": booking.specialist_name
+                }
+                await self.sheets_service.log_transfer(transfer_data)
+            except Exception as log_error:
+                logger.error(f"Message ID: {message_id} - Failed to log transfer: {log_error}")
+
+            return {
+                "success": True,
+                "message": f"Запись перенесена: {booking.specialist_name}",
+                "booking_id": booking.id
+            }
+
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error changing single booking: {e}")
+            return {
+                "success": False,
+                "message": f"Ошибка при переносе записи: {str(e)}"
+            }
+    
+    async def _transfer_multiple_bookings(self, bookings: List[Booking], new_date: date, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[str, Any]:
+        """
+        НОВЫЙ МЕТОД: Переносит несколько записей на новую дату, сохраняя то же время для каждого
+        """
+        try:
+            logger.info(f"Message ID: {message_id} - Transferring {len(bookings)} bookings from {bookings[0].appointment_date} to {new_date}")
+            
+            transferred_bookings = []
+            failed_transfers = []
+            
+            for booking in bookings:
+                try:
+                    # Проверяем доступность нового слота
+                    if not self._is_slot_available(booking.specialist_name, new_date, booking.appointment_time, booking.duration_minutes // 30, booking.id):
+                        failed_transfers.append(f"{booking.specialist_name} ({booking.appointment_time}) - время занято")
+                        logger.warning(f"Message ID: {message_id} - Cannot transfer {booking.specialist_name} at {booking.appointment_time} - slot occupied")
+                        continue
+                    
+                    # Сохраняем старые данные для логирования
+                    old_booking_data = {
+                        "specialist": booking.specialist_name,
+                        "date": booking.appointment_date,
+                        "time": booking.appointment_time,
+                        "duration_slots": booking.duration_minutes // 30
+                    }
+                    
+                    # Очищаем старый слот
+                    try:
+                        await self.sheets_service.clear_booking_slot_async(
+                            booking.specialist_name,
+                            booking.appointment_date,
+                            booking.appointment_time,
+                            booking.duration_minutes // 30
+                        )
+                        logger.info(f"Message ID: {message_id} - Cleared old slot for {booking.specialist_name}")
+                    except Exception as e:
+                        logger.error(f"Message ID: {message_id} - Failed to clear old slot for {booking.specialist_name}: {e}")
+                    
+                    # Обновляем запись
+                    booking.appointment_date = new_date
+                    booking.client_name = response.name or booking.client_name
+                    booking.client_phone = response.phone or booking.client_phone
+                    booking.updated_at = datetime.utcnow()
+                    
+                    transferred_bookings.append(booking)
+                    logger.info(f"Message ID: {message_id} - Updated booking for {booking.specialist_name} to {new_date} {booking.appointment_time}")
+                    
+                except Exception as booking_error:
+                    failed_transfers.append(f"{booking.specialist_name} - ошибка: {str(booking_error)}")
+                    logger.error(f"Message ID: {message_id} - Failed to transfer {booking.specialist_name}: {booking_error}")
+            
+            # Проверяем, что хотя бы одна запись была перенесена
+            if not transferred_bookings:
+                return {
+                    "success": False,
+                    "message": f"Ни одна запись не была перенесена: {'; '.join(failed_transfers)}"
+                }
+            
+            # Сохраняем изменения в базе
+            self.db.commit()
+            logger.info(f"Message ID: {message_id} - Committed {len(transferred_bookings)} booking transfers to database")
+            
+            # Обновляем Google Sheets для каждой перенесенной записи
+            sheets_success_count = 0
+            for booking in transferred_bookings:
+                try:
+                    await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
+                    sheets_success_count += 1
+                    logger.info(f"Message ID: {message_id} - Updated Google Sheets for {booking.specialist_name}")
+                except Exception as sheets_error:
+                    logger.error(f"Message ID: {message_id} - Failed to update sheets for {booking.specialist_name}: {sheets_error}")
+            
+            logger.info(f"Message ID: {message_id} - Updated Google Sheets: {sheets_success_count}/{len(transferred_bookings)} successful")
+            
+            # Логируем переносы
+            for i, booking in enumerate(transferred_bookings):
+                try:
+                    # Получаем старые данные из первоначального списка
+                    old_booking = bookings[i] if i < len(bookings) else bookings[0]
+                    transfer_data = {
+                        "old_date": old_booking.appointment_date.strftime("%d.%m") if old_booking else "?",
+                        "old_full_date": old_booking.appointment_date.strftime("%d.%m.%Y") if old_booking else "?",
+                        "old_time": str(booking.appointment_time),
+                        "new_date": new_date.strftime("%d.%m"),
+                        "new_time": str(booking.appointment_time),
+                        "client_id": client_id,
+                        "client_name": booking.client_name or "Клиент",
+                        "service": booking.service_name or "Услуга",
+                        "old_specialist": booking.specialist_name,
+                        "new_specialist": booking.specialist_name  # Мастер остается тот же
+                    }
+                    await self.sheets_service.log_transfer(transfer_data)
+                except Exception as log_error:
+                    logger.error(f"Message ID: {message_id} - Failed to log transfer for {booking.specialist_name}: {log_error}")
+            
+            # Подготавливаем сообщение о результате
+            success_names = [f"{b.specialist_name} ({b.appointment_time})" for b in transferred_bookings]
+            success_message = f"Перенесено {len(transferred_bookings)} записи: {', '.join(success_names)}"
+            
+            if failed_transfers:
+                success_message += f". Не удалось: {'; '.join(failed_transfers)}"
+            
+            return {
+                "success": True,
+                "message": success_message,
+                "booking_ids": [b.id for b in transferred_bookings],
+                "transferred_count": len(transferred_bookings),
+                "failed_count": len(failed_transfers)
+            }
+            
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error in _transfer_multiple_bookings: {e}")
+            self.db.rollback()  # Откатываем все изменения при ошибке
+            return {
+                "success": False,
+                "message": f"Ошибка при переносе нескольких записей: {str(e)}"
+            }
 
     async def _change_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
         str, Any]:
