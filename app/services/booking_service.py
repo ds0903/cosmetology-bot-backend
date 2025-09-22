@@ -798,10 +798,12 @@ class BookingService:
             logger.warning(f"Message ID: {message_id} - Missing date/time for double booking: date={response.date_order}, time={response.time_set_up}")
             return {"success": False, "message": "Недостаточно данных для двойной записи"}
 
-        # ИСПРАВЛЕНИЕ: Парсим информацию о времени для каждого мастера из gpt_response
+        # ИСПРАВЛЕНИЕ: Парсим информацию о времени И процедурах для каждого мастера из gpt_response
         specialist_times = self._parse_specialist_times_from_response(response.gpt_response, response.specialists_list, message_id)
+        specialist_procedures = self._parse_specialist_procedures_from_response(response.gpt_response, response.specialists_list, message_id)
         
         logger.info(f"Message ID: {message_id} - Parsed specialist times: {specialist_times}")
+        logger.info(f"Message ID: {message_id} - Parsed specialist procedures: {specialist_procedures}")
         
         # Проверим что у нас есть время для каждого мастера
         if len(specialist_times) != len(response.specialists_list):
@@ -869,13 +871,15 @@ class BookingService:
             logger.error(f"Message ID: {message_id} - Error in double booking slot check: {e}")
             return {"success": False, "message": "Ошибка проверки доступности"}
 
-        # ИСПРАВЛЕНИЕ: Создать записи с РАЗНЫМ временем для каждого мастера
-        logger.info(f"Message ID: {message_id} - Creating DOUBLE booking records with different times")
+        # ИСПРАВЛЕНИЕ: Создать записи с РАЗНЫМ временем И процедурами для каждого мастера
+        logger.info(f"Message ID: {message_id} - Creating DOUBLE booking records with different times and procedures")
         bookings = []
         
         try:
             for i, (specialist, booking_time) in enumerate(specialist_times.items()):
-                logger.info(f"Message ID: {message_id} - Creating booking {i+1}/{len(specialist_times)} for {specialist} at {booking_time}")
+                # Получаем процедуру для этого конкретного мастера
+                specialist_procedure = specialist_procedures.get(specialist, response.procedure)
+                logger.info(f"Message ID: {message_id} - Creating booking {i+1}/{len(specialist_times)} for {specialist} at {booking_time} for procedure: {specialist_procedure}")
                 
                 booking = Booking(
                     project_id=self.project_config.project_id,
@@ -884,7 +888,7 @@ class BookingService:
                     appointment_time=booking_time,  # ИСПРАВЛЕНО: используем разное время для каждого
                     client_id=client_id,
                     client_name=response.name,
-                    service_name=response.procedure,
+                    service_name=specialist_procedure,  # ИСПРАВЛЕНО: используем правильную процедуру для каждого мастера
                     client_phone=response.phone,
                     duration_minutes=60,  # Стандартная длительность
                     status="active"
@@ -926,6 +930,7 @@ class BookingService:
         try:
             specialist_names = " + ".join([booking.specialist_name for booking in bookings])
             times_info = ", ".join([f"{b.specialist_name} {b.appointment_time}" for b in bookings])
+            services_info = ", ".join([f"{b.specialist_name}: {b.service_name}" for b in bookings])
             
             make_booking_data = {
                 'date': booking_date.strftime("%d.%m.%Y"),
@@ -933,7 +938,7 @@ class BookingService:
                 'messenger_client_id': client_id,
                 'time': response.time_set_up,  # Базовое время для сортировки
                 'client_name': response.name or "Клиент",
-                'service': f"{response.procedure or 'Услуги'} (двойная запись: {times_info})",
+                'service': f"Двойная запись: {services_info} (время: {times_info})",
                 'specialist': specialist_names
             }
             logger.info(f"Message ID: {message_id} - Adding double booking to Make.com table")
@@ -942,9 +947,12 @@ class BookingService:
         except Exception as make_error:
             logger.error(f"Message ID: {message_id} - ❌ Failed to add to Make.com table: {make_error}")
 
+        specialist_names = " + ".join([booking.specialist_name for booking in bookings])
+        services_summary = ", ".join([f"{b.specialist_name} ({b.service_name})" for b in bookings])
+        
         return {
             "success": True,
-            "message": f"Двойная запись создана: {specialist_names}",
+            "message": f"Двойная запись создана: {services_summary}",
             "booking_ids": [b.id for b in bookings]
         }
 
@@ -1003,4 +1011,81 @@ class BookingService:
             
         except Exception as e:
             logger.error(f"Message ID: {message_id} - Error parsing specialist times: {e}")
+            return {}
+    
+    def _parse_specialist_procedures_from_response(self, gpt_response: str, specialists_list: List[str], message_id: str) -> Dict[str, str]:
+        """
+        НОВЫЙ МЕТОД: Парсит процедуры для каждого мастера из ответа Claude
+        Ищет паттерны типа "к Ольге разовый массаж", "к Анне обертывание"
+        """
+        specialist_procedures = {}
+        
+        try:
+            import re
+            # Паттерны для поиска процедур и имен мастеров
+            procedure_patterns = [
+                r'(?:к|у)\s*([А-ЯЁа-яё]+).*?(разовый массаж|обертывание|массаж|процедура|услуга|фибро[\w\s]*|стратосф[\w\s]*)',  # "к Ольге разовый массаж"
+                r'([А-ЯЁа-яё]+).*?[-–—]\s*(разовый массаж|обертывание|массаж|процедура|услуга|фибро[\w\s]*|стратосф[\w\s]*)',  # "Ольга - разовый массаж"
+                r'(разовый массаж|обертывание|массаж|процедура|услуга|фибро[\w\s]*|стратосф[\w\s]*).*?(?:к|у|для)\s*([А-ЯЁа-яё]+)',  # "разовый массаж к Ольге"
+                r'([А-ЯЁа-яё]+).*?(разовый\s*массаж|обертывание|массаж|фибро[\w\s]*|стратосф[\w\s]*)',  # "Ольге разовый массаж"
+            ]
+            
+            logger.info(f"Message ID: {message_id} - Parsing procedures from response: {gpt_response[:300]}...")
+            
+            for pattern in procedure_patterns:
+                matches = re.findall(pattern, gpt_response, re.IGNORECASE)
+                logger.debug(f"Message ID: {message_id} - Procedure pattern '{pattern}' found matches: {matches}")
+                
+                for match in matches:
+                    if len(match) == 2:
+                        # Определяем что имя, а что процедура
+                        name_candidate = match[0].strip()
+                        procedure_candidate = match[1].strip()
+                        
+                        # Проверим что первое - это имя мастера
+                        matched_specialist = None
+                        name_clean = name_candidate.lower()
+                        
+                        for specialist in specialists_list:
+                            if specialist.lower() in name_clean or name_clean in specialist.lower():
+                                matched_specialist = specialist
+                                specialist_procedures[matched_specialist] = procedure_candidate
+                                logger.info(f"Message ID: {message_id} - Matched procedure: {matched_specialist} -> {procedure_candidate}")
+                                break
+                        
+                        # Если первое не имя мастера, попробуем наоборот
+                        if not matched_specialist:
+                            name_candidate, procedure_candidate = match[1].strip(), match[0].strip()
+                            name_clean = name_candidate.lower()
+                            
+                            for specialist in specialists_list:
+                                if specialist.lower() in name_clean or name_clean in specialist.lower():
+                                    matched_specialist = specialist
+                                    specialist_procedures[matched_specialist] = procedure_candidate
+                                    logger.info(f"Message ID: {message_id} - Matched procedure (reversed): {matched_specialist} -> {procedure_candidate}")
+                                    break
+            
+            # Попробуем также найти процедуры в структурированном тексте
+            # Ищем строки типа "• 11:00 к Ольге — Разовое посещение массажа Stratosphère (110 €)"
+            structured_pattern = r'([А-ЯЁа-яё]+)[^\n]*?[—-]\s*([^\n(]*?)(?:\s*\(|$)'
+            structured_matches = re.findall(structured_pattern, gpt_response, re.IGNORECASE | re.MULTILINE)
+            
+            for match in structured_matches:
+                name_candidate = match[0].strip()
+                procedure_text = match[1].strip()
+                
+                for specialist in specialists_list:
+                    if specialist.lower() in name_candidate.lower() or name_candidate.lower() in specialist.lower():
+                        # Очистим процедуру от лишнего текста
+                        clean_procedure = procedure_text.replace('Разовое посещение', '').replace('массажа', 'массаж').strip()
+                        if clean_procedure:
+                            specialist_procedures[specialist] = clean_procedure
+                            logger.info(f"Message ID: {message_id} - Matched structured procedure: {specialist} -> {clean_procedure}")
+                        break
+            
+            logger.info(f"Message ID: {message_id} - Final parsed procedures: {specialist_procedures}")
+            return specialist_procedures
+            
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error parsing specialist procedures: {e}")
             return {}
