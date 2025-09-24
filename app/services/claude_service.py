@@ -959,16 +959,19 @@ current_message: {current_message}"""
                 "procedure": result.get("procedure"),
                 "phone": result.get("phone"),
                 "name": result.get("name"),
-                "feedback": result.get("feedback")
-            }
-            parsed_result.update({
+                "feedback": result.get("feedback"),
+
                 "double_booking": result.get("double_booking"),
-                "specialists_list": result.get("specialists_list"),
-                # поддержим альтернативные названия на всякий случай
-                "second_date_order": result.get("second_date_order") or result.get("date_order2"),
-                "second_time_set_up": result.get("second_time_set_up") or result.get("time_set_up2"),
-                "second_procedure": result.get("second_procedure") or result.get("procedure2"),
-            })
+                "specialists_list": result.get("specialists_list")
+            }
+            
+
+            if parsed_result.get("double_booking") or parsed_result.get("specialists_list"):
+                logger.info(f"Message ID: {message_id} - 🔧 DOUBLE BOOKING FIELDS DETECTED:")
+                logger.info(f"Message ID: {message_id} - double_booking={parsed_result.get('double_booking')}")
+                logger.info(f"Message ID: {message_id} - specialists_list={parsed_result.get('specialists_list')}")
+                logger.info(f"Message ID: {message_id} - activate_booking={parsed_result.get('activate_booking')}")
+            
             logger.debug(f"Message ID: {message_id} - Main response parsed successfully: {parsed_result}")
             return parsed_result
         except Exception as e:
