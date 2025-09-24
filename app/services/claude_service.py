@@ -960,9 +960,10 @@ current_message: {current_message}"""
                 "phone": result.get("phone"),
                 "name": result.get("name"),
                 "feedback": result.get("feedback"),
-
                 "double_booking": result.get("double_booking"),
-                "specialists_list": result.get("specialists_list")
+                "specialists_list": result.get("specialists_list"),
+                "times_set_up_list": result.get("times_set_up_list"),
+                "procedures_list": result.get("procedures_list")
             }
             
 
@@ -970,6 +971,8 @@ current_message: {current_message}"""
                 logger.info(f"Message ID: {message_id} - 🔧 DOUBLE BOOKING FIELDS DETECTED:")
                 logger.info(f"Message ID: {message_id} - double_booking={parsed_result.get('double_booking')}")
                 logger.info(f"Message ID: {message_id} - specialists_list={parsed_result.get('specialists_list')}")
+                logger.info(f"Message ID: {message_id} - times_set_up_list={parsed_result.get('times_set_up_list')}")
+                logger.info(f"Message ID: {message_id} - procedures_list={parsed_result.get('procedures_list')}")
                 logger.info(f"Message ID: {message_id} - activate_booking={parsed_result.get('activate_booking')}")
             
             logger.debug(f"Message ID: {message_id} - Main response parsed successfully: {parsed_result}")
