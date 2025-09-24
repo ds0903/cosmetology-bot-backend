@@ -458,7 +458,7 @@ class BookingService:
 
     async def _reject_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
         str, Any]:
-        """Reject/cancel a double booking"""
+        """Reject/cancel a double booking - supports different times for each specialist"""
         try:
             if not response.specialists_list or len(response.specialists_list) < 2:
                 return {
@@ -466,30 +466,61 @@ class BookingService:
                     "message": "Недостаточно специалистов для отмены двойной записи"
                 }
 
-            # Parse date and time
-            booking_date = self._parse_date(response.date_reject)
-            booking_time = self._parse_time(response.time_reject)
+            specialist1, specialist2 = response.specialists_list[0], response.specialists_list[1]
 
-            if not booking_date or not booking_time:
+            # Parse date
+            booking_date = self._parse_date(response.date_reject)
+            if not booking_date:
                 return {
                     "success": False,
-                    "message": "Неверный формат даты или времени"
+                    "message": "Неверный формат даты"
                 }
+
+            # Извлекаем время для КАЖДОГО мастера отдельно
+            times_reject_list = getattr(response, 'times_reject_list', None)
+            if times_reject_list and len(times_reject_list) >= 2:
+                booking_time1 = self._parse_time(times_reject_list[0])
+                booking_time2 = self._parse_time(times_reject_list[1])
+                logger.info(f"Message ID: {message_id} - Cancelling with different times: {specialist1} at {times_reject_list[0]}, {specialist2} at {times_reject_list[1]}")
+            else:
+                # Если список времен не предоставлен - ищем по ЛЮБОМУ времени на эту дату
+                booking_time1 = None
+                booking_time2 = None
+                logger.info(f"Message ID: {message_id} - No times_reject_list, will search for any booking on {booking_date}")
 
             cancelled_bookings = []
 
-            # Найти и отменить записи для ОБОИХ мастеров
-            for specialist in response.specialists_list:
-                booking = self.db.query(Booking).filter(
-                    and_(
-                        Booking.project_id == self.project_config.project_id,
-                        Booking.client_id == client_id,
-                        Booking.specialist_name == specialist,
-                        Booking.appointment_date == booking_date,
-                        Booking.appointment_time == booking_time,
-                        Booking.status == "active"
-                    )
-                ).first()
+            # Найти и отменить записи для КАЖДОГО мастера С ЕГО ВРЕМЕНЕМ
+            specialists_times = [
+                (specialist1, booking_time1),
+                (specialist2, booking_time2)
+            ]
+
+            for specialist, booking_time in specialists_times:
+                # Строим запрос в зависимости от того, есть ли время
+                if booking_time:
+                    # Ищем по конкретному времени
+                    booking = self.db.query(Booking).filter(
+                        and_(
+                            Booking.project_id == self.project_config.project_id,
+                            Booking.client_id == client_id,
+                            Booking.specialist_name == specialist,
+                            Booking.appointment_date == booking_date,
+                            Booking.appointment_time == booking_time,
+                            Booking.status == "active"
+                        )
+                    ).first()
+                else:
+                    # Ищем ЛЮБУЮ запись на эту дату
+                    booking = self.db.query(Booking).filter(
+                        and_(
+                            Booking.project_id == self.project_config.project_id,
+                            Booking.client_id == client_id,
+                            Booking.specialist_name == specialist,
+                            Booking.appointment_date == booking_date,
+                            Booking.status == "active"
+                        )
+                    ).first()
 
                 if booking:
                     # Cancel booking
@@ -526,16 +557,20 @@ class BookingService:
             self.db.commit()
 
             if cancelled_bookings:
-                specialists_names = [b.specialist_name for b in cancelled_bookings]
+                # Формируем подробное сообщение с временем для каждого мастера
+                details = []
+                for booking in cancelled_bookings:
+                    details.append(f"{booking.specialist_name} в {booking.appointment_time.strftime('%H:%M')}")
+                
                 return {
                     "success": True,
-                    "message": f"Двойная запись отменена: {', '.join(specialists_names)}",
+                    "message": f"Двойная запись отменена: {' + '.join(details)}",
                     "booking_ids": [b.id for b in cancelled_bookings]
                 }
             else:
                 return {
                     "success": False,
-                    "message": "Записи не найдены для отмены"
+                    "message": f"Записи не найдены для отмены на {booking_date.strftime('%d.%m.%Y')}"
                 }
 
         except Exception as e:
