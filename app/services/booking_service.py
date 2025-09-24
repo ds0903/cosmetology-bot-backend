@@ -642,19 +642,22 @@ class BookingService:
                     "message": "Ошибка проверки доступности нового времени"
                 }
 
-            # Save old booking data for logging
+            # Save old booking data for logging AND for clearing slots
             old_specialist = booking.specialist_name
+            old_date = booking.appointment_date
+            old_time = booking.appointment_time
+            old_duration_slots = booking.duration_minutes // 30
             old_procedure = booking.service_name
 
-            # Clear old slot in Google Sheets
+            # Clear old slot in Google Sheets BEFORE updating booking
             try:
                 await self.sheets_service.clear_booking_slot_async(
-                    booking.specialist_name,
-                    booking.appointment_date,
-                    booking.appointment_time,
-                    duration_slots
+                    old_specialist,
+                    old_date,
+                    old_time,
+                    old_duration_slots
                 )
-                logger.debug(f"Message ID: {message_id} - Cleared old booking slot in Google Sheets")
+                logger.debug(f"Message ID: {message_id} - Cleared old booking slot in Google Sheets: {old_specialist} at {old_date} {old_time}")
             except Exception as clear_error:
                 logger.error(f"Message ID: {message_id} - Failed to clear old slot: {clear_error}")
                 # Continue despite error
@@ -820,15 +823,17 @@ class BookingService:
                     "duration_slots": booking.duration_minutes // 30
                 })
 
-            # Очистить старые слоты
-            for booking in bookings_to_change:
+            # Очистить старые слоты ВИКОРИСТОВУЮЧИ ЗБЕРЕЖЕНІ СТАРІ ДАНІ
+            for i, booking in enumerate(bookings_to_change):
                 try:
+                    # ВИКОРИСТОВУЄМО old_data[i] замість booking для очищення старих слотів!
                     await self.sheets_service.clear_booking_slot_async(
-                        booking.specialist_name,
-                        booking.appointment_date,
-                        booking.appointment_time,
-                        booking.duration_minutes // 30
+                        old_data[i]["specialist"],  # СТАРИЙ спеціаліст
+                        old_data[i]["date"],         # СТАРА дата
+                        old_data[i]["time"],         # СТАРИЙ час
+                        old_data[i]["duration_slots"]  # СТАРА тривалість
                     )
+                    logger.info(f"Message ID: {message_id} - Cleared OLD slot: {old_data[i]['specialist']} at {old_data[i]['date']} {old_data[i]['time']}")
                 except Exception as e:
                     logger.error(f"Message ID: {message_id} - Failed to clear old slot: {e}")
 
