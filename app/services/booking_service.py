@@ -332,11 +332,6 @@ class BookingService:
                 "message": f"Ошибка при отмене записи: {str(e)}"
             }
 
-    async def _reject_single_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
-        str, Any]:
-        """Reject/cancel a single booking"""
-        # Ваш существующий код _reject_booking переместить сюда
-        # ... (весь код из текущего _reject_booking)
 
     async def _reject_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
         str, Any]:
@@ -443,11 +438,6 @@ class BookingService:
                 "message": f"Ошибка при изменении записи: {str(e)}"
             }
 
-    async def _change_single_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
-        str, Any]:
-        """Change a single booking"""
-        # Ваш существующий код _change_booking переместить сюда
-        # ... (весь код из текущего _change_booking)
 
     async def _change_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
         str, Any]:
