@@ -727,57 +727,87 @@ class BookingService:
                     "message": "Недостаточно специалистов для переноса двойной записи"
                 }
 
-            # Найти существующие записи для переноса
-            old_bookings = self.db.query(Booking).filter(
+            # Найти существующие записи ПО ИМЕНАМ МАСТЕРОВ из specialists_list
+            specialist1, specialist2 = response.specialists_list[0], response.specialists_list[1]
+            
+            # Найти запись для первого мастера
+            booking1 = self.db.query(Booking).filter(
                 and_(
                     Booking.project_id == self.project_config.project_id,
                     Booking.client_id == client_id,
+                    Booking.specialist_name == specialist1,
                     Booking.status == "active"
                 )
-            ).all()
+            ).first()
+            
+            # Найти запись для второго мастера
+            booking2 = self.db.query(Booking).filter(
+                and_(
+                    Booking.project_id == self.project_config.project_id,
+                    Booking.client_id == client_id,
+                    Booking.specialist_name == specialist2,
+                    Booking.status == "active"
+                )
+            ).first()
 
-            if not old_bookings:
+            if not booking1 or not booking2:
+                missing = []
+                if not booking1:
+                    missing.append(specialist1)
+                if not booking2:
+                    missing.append(specialist2)
                 return {
                     "success": False,
-                    "message": "Активные записи не найдены"
+                    "message": f"Не найдены активные записи у мастера(ов): {', '.join(missing)}"
                 }
 
-            # Parse new date and time
+            bookings_to_change = [booking1, booking2]
+
+            # Parse new date
             new_date = self._parse_date(response.date_order)
-            new_time = self._parse_time(response.time_set_up)
-
-            if not new_date or not new_time:
+            if not new_date:
                 return {
                     "success": False,
-                    "message": "Неверный формат новой даты или времени"
+                    "message": "Неверный формат новой даты"
                 }
 
-            # Проверить доступность ОБОИХ новых мастеров
-            specialist1, specialist2 = response.specialists_list[0], response.specialists_list[1]
+            # Извлекаем время для КАЖДОГО мастера отдельно
+            times_list = getattr(response, 'times_set_up_list', None)
+            if times_list and len(times_list) >= 2:
+                new_time1 = self._parse_time(times_list[0])
+                new_time2 = self._parse_time(times_list[1])
+                logger.info(f"Message ID: {message_id} - Changing to different times: {specialist1} at {times_list[0]}, {specialist2} at {times_list[1]}")
+            else:
+                # Если список времен не предоставлен, используем старое время каждой записи
+                new_time1 = booking1.appointment_time
+                new_time2 = booking2.appointment_time
+                logger.info(f"Message ID: {message_id} - No times_set_up_list, keeping original times")
+            
+            # Извлекаем процедуры для КАЖДОГО мастера отдельно
+            procedures_list = getattr(response, 'procedures_list', None)
+            if procedures_list and len(procedures_list) >= 2:
+                new_procedure1 = procedures_list[0]
+                new_procedure2 = procedures_list[1]
+                logger.info(f"Message ID: {message_id} - Changing to different procedures: {new_procedure1}, {new_procedure2}")
+            else:
+                # Если список процедур не предоставлен, оставляем старые процедуры
+                new_procedure1 = booking1.service_name
+                new_procedure2 = booking2.service_name
+                logger.info(f"Message ID: {message_id} - No procedures_list, keeping original procedures")
 
-            slot1_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist1, new_date,
-                                                                                          new_time)
-            slot2_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist2, new_date,
-                                                                                          new_time)
+            # Проверить доступность новых слотов для ОБОИХ мастеров
+            slot1_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist1, new_date, new_time1)
+            slot2_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist2, new_date, new_time2)
 
             if not slot1_available or not slot2_available:
                 occupied_specialists = []
                 if not slot1_available:
-                    occupied_specialists.append(specialist1)
+                    occupied_specialists.append(f"{specialist1} на {new_time1.strftime('%H:%M')}")
                 if not slot2_available:
-                    occupied_specialists.append(specialist2)
+                    occupied_specialists.append(f"{specialist2} на {new_time2.strftime('%H:%M')}")
                 return {
                     "success": False,
-                    "message": f"Новое время занято у мастера(ов): {', '.join(occupied_specialists)}"
-                }
-
-            # Найти записи для переноса (берем две последние активные записи клиента)
-            bookings_to_change = sorted(old_bookings, key=lambda x: x.created_at, reverse=True)[:2]
-
-            if len(bookings_to_change) < 2:
-                return {
-                    "success": False,
-                    "message": "Недостаточно записей для переноса в двойную запись"
+                    "message": f"Новое время занято: {', '.join(occupied_specialists)}"
                 }
 
             # Сохранить старые данные для логирования
@@ -791,7 +821,7 @@ class BookingService:
                 })
 
             # Очистить старые слоты
-            for i, booking in enumerate(bookings_to_change):
+            for booking in bookings_to_change:
                 try:
                     await self.sheets_service.clear_booking_slot_async(
                         booking.specialist_name,
@@ -802,21 +832,26 @@ class BookingService:
                 except Exception as e:
                     logger.error(f"Message ID: {message_id} - Failed to clear old slot: {e}")
 
-            # Обновить записи для новых мастеров
+            # Обновить записи с РАЗНЫМ временем и процедурами
+            new_times = [new_time1, new_time2]
+            new_procedures = [new_procedure1, new_procedure2]
+            
             for i, booking in enumerate(bookings_to_change):
-                new_specialist = response.specialists_list[i]
-
-                booking.specialist_name = new_specialist
                 booking.appointment_date = new_date
-                booking.appointment_time = new_time
+                booking.appointment_time = new_times[i]
+                booking.service_name = new_procedures[i]
                 booking.client_name = response.name or booking.client_name
-                booking.service_name = response.procedure or booking.service_name
                 booking.client_phone = response.phone or booking.client_phone
                 booking.updated_at = datetime.utcnow()
+                
+                # Обновить длительность если процедура изменилась
+                if new_procedures[i] in self.project_config.services:
+                    duration_slots = self.project_config.services[new_procedures[i]]
+                    booking.duration_minutes = duration_slots * 30
 
             self.db.commit()
 
-            # Обновить Google Sheets для ОБОИХ новых мастеров
+            # Обновить Google Sheets для ОБОИХ мастеров
             for booking in bookings_to_change:
                 await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
 
@@ -828,10 +863,10 @@ class BookingService:
                         "old_full_date": old_data[i]["date"].strftime("%d.%m.%Y"),
                         "old_time": str(old_data[i]["time"]),
                         "new_date": new_date.strftime("%d.%m"),
-                        "new_time": str(new_time),
+                        "new_time": str(new_times[i]),
                         "client_id": client_id,
                         "client_name": booking.client_name or "Клиент",
-                        "service": f"{booking.service_name} (двойная запись)",
+                        "service": booking.service_name,
                         "old_specialist": old_data[i]["specialist"],
                         "new_specialist": booking.specialist_name
                     }
@@ -841,7 +876,7 @@ class BookingService:
 
             return {
                 "success": True,
-                "message": f"Двойная запись перенесена: {specialist1} + {specialist2}",
+                "message": f"Двойная запись перенесена: {specialist1} ({new_procedure1} в {new_time1.strftime('%H:%M')}) + {specialist2} ({new_procedure2} в {new_time2.strftime('%H:%M')})",
                 "booking_ids": [b.id for b in bookings_to_change]
             }
 
@@ -1054,28 +1089,61 @@ class BookingService:
 
         # Проверить доступность ОБОИХ мастеров
         booking_date = self._parse_date(response.date_order)
-        booking_time = self._parse_time(response.time_set_up)
+        
+        # Извлекаем время для КАЖДОГО мастера отдельно
+        # Если есть список времен - используем его, иначе используем одно время для обоих
+        times_list = getattr(response, 'times_set_up_list', None)
+        if times_list and len(times_list) >= 2:
+            booking_time1 = self._parse_time(times_list[0])
+            booking_time2 = self._parse_time(times_list[1])
+            logger.info(f"Message ID: {message_id} - Using different times: {specialist1} at {times_list[0]}, {specialist2} at {times_list[1]}")
+        else:
+            # Если список времен не предоставлен, используем одно время
+            booking_time1 = booking_time2 = self._parse_time(response.time_set_up)
+            logger.warning(f"Message ID: {message_id} - No times_set_up_list provided, using same time {response.time_set_up} for both specialists")
+        
+        # Извлекаем процедуры для КАЖДОГО мастера отдельно
+        procedures_list = getattr(response, 'procedures_list', None)
+        if procedures_list and len(procedures_list) >= 2:
+            procedure1 = procedures_list[0]
+            procedure2 = procedures_list[1]
+            logger.info(f"Message ID: {message_id} - Using different procedures: {specialist1} - {procedure1}, {specialist2} - {procedure2}")
+        else:
+            # Если список процедур не предоставлен, используем одну процедуру
+            procedure1 = procedure2 = response.procedure
+            logger.warning(f"Message ID: {message_id} - No procedures_list provided, using same procedure '{response.procedure}' for both specialists")
 
-        # Проверка в Google Sheets для обоих мастеров
+        # Проверка в Google Sheets для обоих мастеров С ИХ ВРЕМЕНЕМ
         slot1_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist1, booking_date,
-                                                                                      booking_time)
+                                                                                      booking_time1)
         slot2_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist2, booking_date,
-                                                                                      booking_time)
+                                                                                      booking_time2)
 
         if not slot1_available or not slot2_available:
             occupied_specialists = []
             if not slot1_available:
-                occupied_specialists.append(specialist1)
+                occupied_specialists.append(f"{specialist1} на {booking_time1.strftime('%H:%M')}")
             if not slot2_available:
-                occupied_specialists.append(specialist2)
+                occupied_specialists.append(f"{specialist2} на {booking_time2.strftime('%H:%M')}")
             return {
                 "success": False,
-                "message": f"Мастер(а) {', '.join(occupied_specialists)} заняты на это время"
+                "message": f"Время занято: {', '.join(occupied_specialists)}"
             }
 
-        # Создать ДВЕ записи в БД
+        # Создать ДВЕ записи в БД с РАЗНЫМ временем и РАЗНЫМИ процедурами
         bookings = []
-        for specialist in [specialist1, specialist2]:
+        specialists_data = [
+            (specialist1, booking_time1, procedure1),
+            (specialist2, booking_time2, procedure2)
+        ]
+        
+        for specialist, booking_time, procedure in specialists_data:
+            # Определяем длительность процедуры
+            duration_slots = 1
+            if procedure and procedure in self.project_config.services:
+                duration_slots = self.project_config.services[procedure]
+                logger.info(f"Message ID: {message_id} - Service '{procedure}' for {specialist} requires {duration_slots} slots")
+            
             booking = Booking(
                 project_id=self.project_config.project_id,
                 specialist_name=specialist,
@@ -1083,13 +1151,14 @@ class BookingService:
                 appointment_time=booking_time,
                 client_id=client_id,
                 client_name=response.name,
-                service_name=response.procedure,
+                service_name=procedure,
                 client_phone=response.phone,
-                duration_minutes=60,  # Стандартная длительность
+                duration_minutes=duration_slots * 30,
                 status="active"
             )
             self.db.add(booking)
             bookings.append(booking)
+            logger.info(f"Message ID: {message_id} - Created booking for {specialist} at {booking_time.strftime('%H:%M')} - {procedure}")
 
         self.db.commit()
 
@@ -1097,19 +1166,20 @@ class BookingService:
         for booking in bookings:
             await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
 
-        # Добавить в Make.com таблицу
-        make_booking_data = {
-            'date': booking_date.strftime("%d.%m.%Y"),
-            'client_id': contact_send_id if contact_send_id else client_id,
-            'time': booking_time.strftime('%H:%M'),
-            'client_name': response.name or "Клиент",
-            'service': f"{response.procedure} (двойная запись)",
-            'specialist': f"{specialist1} + {specialist2}"
-        }
-        await self.sheets_service.add_booking_to_make_table_async(make_booking_data)
+        # Добавить в Make.com таблицу (для каждого мастера отдельно)
+        for i, booking in enumerate(bookings):
+            make_booking_data = {
+                'date': booking_date.strftime("%d.%m.%Y"),
+                'client_id': contact_send_id if contact_send_id else client_id,
+                'time': booking.appointment_time.strftime('%H:%M'),
+                'client_name': response.name or "Клиент",
+                'service': booking.service_name,
+                'specialist': booking.specialist_name
+            }
+            await self.sheets_service.add_booking_to_make_table_async(make_booking_data)
 
         return {
             "success": True,
-            "message": f"Двойная запись создана: {specialist1} + {specialist2}",
+            "message": f"Двойная запись создана: {specialist1} ({procedure1} в {booking_time1.strftime('%H:%M')}) + {specialist2} ({procedure2} в {booking_time2.strftime('%H:%M')})",
             "booking_ids": [b.id for b in bookings]
         }

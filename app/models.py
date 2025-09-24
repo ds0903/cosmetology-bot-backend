@@ -87,6 +87,8 @@ class ClaudeMainResponse(BaseModel):
     cosmetolog_2: Optional[str] = Field(None, description="Second specialist name")
     double_booking: Optional[bool] = Field(None, description="Is this a double booking")
     specialists_list: Optional[List[str]] = Field(None, description="List of specialists for double booking")
+    times_set_up_list: Optional[List[str]] = Field(None, description="List of times for each specialist in double booking (HH:MM format)")
+    procedures_list: Optional[List[str]] = Field(None, description="List of procedures for each specialist in double booking")
 
 
 class BookingRecord(BaseModel):
