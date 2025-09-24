@@ -335,8 +335,96 @@ class BookingService:
     async def _reject_single_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
         str, Any]:
         """Reject/cancel a single booking"""
-        # Ваш существующий код _reject_booking переместить сюда
-        # ... (весь код из текущего _reject_booking)
+        logger.info(f"Message ID: {message_id} - Rejecting single booking for client_id={client_id}")
+        
+        try:
+            # Validate required fields
+            if not response.date_reject or not response.time_reject:
+                logger.warning(f"Message ID: {message_id} - Missing booking data: date={response.date_reject}, time={response.time_reject}")
+                return {
+                    "success": False,
+                    "message": "Недостаточно данных для отмены записи"
+                }
+            
+            # Parse date and time
+            booking_date = self._parse_date(response.date_reject)
+            booking_time = self._parse_time(response.time_reject)
+            
+            if not booking_date or not booking_time:
+                logger.warning(f"Message ID: {message_id} - Invalid date/time format")
+                return {
+                    "success": False,
+                    "message": "Неверный формат даты или времени"
+                }
+            
+            # Find booking to cancel
+            booking = self.db.query(Booking).filter(
+                and_(
+                    Booking.project_id == self.project_config.project_id,
+                    Booking.client_id == client_id,
+                    Booking.appointment_date == booking_date,
+                    Booking.appointment_time == booking_time,
+                    Booking.status == "active"
+                )
+            ).first()
+            
+            if not booking:
+                logger.warning(f"Message ID: {message_id} - Booking not found for cancellation")
+                return {
+                    "success": False,
+                    "message": "Запись для отмены не найдена"
+                }
+            
+            # Cancel booking
+            booking.status = "cancelled"
+            booking.updated_at = datetime.utcnow()
+            
+            self.db.commit()
+            
+            logger.info(f"Message ID: {message_id} - Booking cancelled in database: booking_id={booking.id}")
+            
+            # Clear slot in Google Sheets
+            try:
+                duration_slots = booking.duration_minutes // 30
+                await self.sheets_service.clear_booking_slot_async(
+                    booking.specialist_name,
+                    booking.appointment_date,
+                    booking.appointment_time,
+                    duration_slots
+                )
+                logger.debug(f"Message ID: {message_id} - Cleared booking slot in Google Sheets")
+            except Exception as sheets_error:
+                logger.error(f"Message ID: {message_id} - Failed to clear booking slot: {sheets_error}")
+                # Continue despite error
+            
+            # Log cancellation to Google Sheets
+            try:
+                cancellation_data = {
+                    "date": booking.appointment_date.strftime("%d.%m"),
+                    "full_date": booking.appointment_date.strftime("%d.%m.%Y"),
+                    "time": str(booking.appointment_time),
+                    "client_id": client_id,
+                    "client_name": booking.client_name or "Клиент",
+                    "service": booking.service_name or "Услуга",
+                    "specialist": booking.specialist_name
+                }
+                await self.sheets_service.log_cancellation(cancellation_data)
+                logger.debug(f"Message ID: {message_id} - Cancellation logged to Google Sheets")
+            except Exception as log_error:
+                logger.error(f"Message ID: {message_id} - Failed to log cancellation: {log_error}")
+            
+            return {
+                "success": True,
+                "message": f"Запись отменена: {booking.specialist_name}, {booking.appointment_date.strftime('%d.%m.%Y')} {booking.appointment_time.strftime('%H:%M')}",
+                "booking_id": booking.id
+            }
+            
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error cancelling single booking: {e}", exc_info=True)
+            return {
+                "success": False,
+                "message": f"Ошибка при отмене записи: {str(e)}"
+            }
 
     async def _reject_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
         str, Any]:
@@ -446,8 +534,155 @@ class BookingService:
     async def _change_single_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
         str, Any]:
         """Change a single booking"""
-        # Ваш существующий код _change_booking переместить сюда
-        # ... (весь код из текущего _change_booking)
+        logger.info(f"Message ID: {message_id} - Changing single booking for client_id={client_id}")
+        
+        try:
+            # Validate required fields
+            if not response.date_reject or not response.time_reject:
+                logger.warning(f"Message ID: {message_id} - Missing old booking data: date={response.date_reject}, time={response.time_reject}")
+                return {
+                    "success": False,
+                    "message": "Недостаточно данных для поиска старой записи"
+                }
+            
+            if not response.date_order or not response.time_set_up:
+                logger.warning(f"Message ID: {message_id} - Missing new booking data: date={response.date_order}, time={response.time_set_up}")
+                return {
+                    "success": False,
+                    "message": "Недостаточно данных для новой записи"
+                }
+            
+            # Parse dates and times
+            old_date = self._parse_date(response.date_reject)
+            old_time = self._parse_time(response.time_reject)
+            new_date = self._parse_date(response.date_order)
+            new_time = self._parse_time(response.time_set_up)
+            
+            if not old_date or not old_time:
+                logger.warning(f"Message ID: {message_id} - Invalid old date/time format")
+                return {
+                    "success": False,
+                    "message": "Неверный формат старой даты или времени"
+                }
+            
+            if not new_date or not new_time:
+                logger.warning(f"Message ID: {message_id} - Invalid new date/time format")
+                return {
+                    "success": False,
+                    "message": "Неверный формат новой даты или времени"
+                }
+            
+            # Find existing booking
+            booking = self.db.query(Booking).filter(
+                and_(
+                    Booking.project_id == self.project_config.project_id,
+                    Booking.client_id == client_id,
+                    Booking.appointment_date == old_date,
+                    Booking.appointment_time == old_time,
+                    Booking.status == "active"
+                )
+            ).first()
+            
+            if not booking:
+                logger.warning(f"Message ID: {message_id} - Booking not found for transfer: client_id={client_id}, date={old_date}, time={old_time}")
+                return {
+                    "success": False,
+                    "message": "Запись для переноса не найдена"
+                }
+            
+            # Check if new time slot is available
+            new_specialist = response.cosmetolog or booking.specialist_name
+            duration_slots = booking.duration_minutes // 30
+            
+            # Check in Google Sheets
+            try:
+                if not await self.sheets_service.is_slot_available_in_sheets_async(new_specialist, new_date, new_time):
+                    logger.warning(f"Message ID: {message_id} - New time slot not available in Google Sheets")
+                    return {
+                        "success": False,
+                        "message": "Новое время уже занято"
+                    }
+            except Exception as sheets_error:
+                logger.error(f"Message ID: {message_id} - Error checking new slot availability: {sheets_error}")
+                return {
+                    "success": False,
+                    "message": "Ошибка проверки доступности нового времени"
+                }
+            
+            # Save old booking data for logging
+            old_specialist = booking.specialist_name
+            old_procedure = booking.service_name
+            
+            # Clear old slot in Google Sheets
+            try:
+                await self.sheets_service.clear_booking_slot_async(
+                    booking.specialist_name,
+                    booking.appointment_date,
+                    booking.appointment_time,
+                    duration_slots
+                )
+                logger.debug(f"Message ID: {message_id} - Cleared old booking slot in Google Sheets")
+            except Exception as clear_error:
+                logger.error(f"Message ID: {message_id} - Failed to clear old slot: {clear_error}")
+                # Continue despite error
+            
+            # Update booking with new data
+            booking.specialist_name = new_specialist
+            booking.appointment_date = new_date
+            booking.appointment_time = new_time
+            
+            if response.name:
+                booking.client_name = response.name
+            if response.procedure:
+                booking.service_name = response.procedure
+            if response.phone:
+                booking.client_phone = response.phone
+            
+            booking.updated_at = datetime.utcnow()
+            
+            self.db.commit()
+            self.db.refresh(booking)
+            
+            logger.info(f"Message ID: {message_id} - Booking updated in database: booking_id={booking.id}")
+            
+            # Update new slot in Google Sheets
+            try:
+                await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
+                logger.debug(f"Message ID: {message_id} - Updated new booking slot in Google Sheets")
+            except Exception as update_error:
+                logger.error(f"Message ID: {message_id} - Failed to update new slot: {update_error}")
+            
+            # Log transfer to Google Sheets
+            try:
+                transfer_data = {
+                    "old_date": old_date.strftime("%d.%m"),
+                    "old_full_date": old_date.strftime("%d.%m.%Y"),
+                    "old_time": str(old_time),
+                    "new_date": new_date.strftime("%d.%m"),
+                    "new_time": str(new_time),
+                    "client_id": client_id,
+                    "client_name": booking.client_name or "Клиент",
+                    "service": booking.service_name or old_procedure or "Услуга",
+                    "old_specialist": old_specialist,
+                    "new_specialist": new_specialist
+                }
+                await self.sheets_service.log_transfer(transfer_data)
+                logger.debug(f"Message ID: {message_id} - Transfer logged to Google Sheets")
+            except Exception as log_error:
+                logger.error(f"Message ID: {message_id} - Failed to log transfer: {log_error}")
+            
+            return {
+                "success": True,
+                "message": f"Запись перенесена: {new_specialist}, {new_date.strftime('%d.%m.%Y')} {new_time.strftime('%H:%M')}",
+                "booking_id": booking.id
+            }
+            
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error changing single booking: {e}", exc_info=True)
+            return {
+                "success": False,
+                "message": f"Ошибка при переносе записи: {str(e)}"
+            }
 
     async def _change_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
         str, Any]:
