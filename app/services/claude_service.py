@@ -961,6 +961,14 @@ current_message: {current_message}"""
                 "name": result.get("name"),
                 "feedback": result.get("feedback")
             }
+            parsed_result.update({
+                "double_booking": result.get("double_booking"),
+                "specialists_list": result.get("specialists_list"),
+                # поддержим альтернативные названия на всякий случай
+                "second_date_order": result.get("second_date_order") or result.get("date_order2"),
+                "second_time_set_up": result.get("second_time_set_up") or result.get("time_set_up2"),
+                "second_procedure": result.get("second_procedure") or result.get("procedure2"),
+            })
             logger.debug(f"Message ID: {message_id} - Main response parsed successfully: {parsed_result}")
             return parsed_result
         except Exception as e:

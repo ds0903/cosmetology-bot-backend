@@ -1044,7 +1044,7 @@ class BookingService:
 
     async def _activate_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str,
                                        contact_send_id: str = None) -> Dict[str, Any]:
-        """Активация двойной записи к двум мастерам"""
+        """Активация двойной записи к двум мастерам (каждому — своё время/процедура)"""
         logger.info(f"Message ID: {message_id} - Activating DOUBLE booking for client_id={client_id}")
 
         if not response.specialists_list or len(response.specialists_list) < 2:
@@ -1052,40 +1052,69 @@ class BookingService:
 
         specialist1, specialist2 = response.specialists_list[0], response.specialists_list[1]
 
-        # Проверить доступность ОБОИХ мастеров
-        booking_date = self._parse_date(response.date_order)
-        booking_time = self._parse_time(response.time_set_up)
+        # 1) Разбираем даты/время по каждому мастеру
+        date1 = self._parse_date(response.date_order)
+        time1 = self._parse_time(response.time_set_up)
 
-        # Проверка в Google Sheets для обоих мастеров
-        slot1_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist1, booking_date,
-                                                                                      booking_time)
-        slot2_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist2, booking_date,
-                                                                                      booking_time)
+        # для второго берём его собственные поля, а при их отсутствии — падение в поля первого
+        date2 = self._parse_date(response.second_date_order or response.date_order)
+        time2 = self._parse_time(response.second_time_set_up or response.time_set_up)
 
-        if not slot1_available or not slot2_available:
-            occupied_specialists = []
-            if not slot1_available:
-                occupied_specialists.append(specialist1)
-            if not slot2_available:
-                occupied_specialists.append(specialist2)
-            return {
-                "success": False,
-                "message": f"Мастер(а) {', '.join(occupied_specialists)} заняты на это время"
-            }
+        if not (date1 and time1 and date2 and time2):
+            return {"success": False, "message": "Неверный формат даты/времени для двойной записи"}
 
-        # Создать ДВЕ записи в БД
+        # 2) Ф-ция расчёта длительности и нормализации услуги (как в single)
+        async def _duration_and_name(proc: str) -> tuple[int, str]:
+            duration_slots = 1
+            normalized_service = proc
+
+            if proc and proc in self.project_config.services:
+                duration_slots = self.project_config.services[proc]
+            elif proc:
+                # повторяем логику normalize_service_name из single
+                from .services.claude_service import ClaudeService
+                from .database import SessionLocal
+                try:
+                    normalize_db = SessionLocal()
+                    claude_service = ClaudeService(normalize_db)
+                    normalized = await claude_service.normalize_service_name(self.project_config, proc, message_id)
+                    if normalized in self.project_config.services:
+                        normalized_service = normalized
+                        duration_slots = self.project_config.services[normalized]
+                    normalize_db.close()
+                except Exception as e:
+                    logger.error(f"Message ID: {message_id} - Error during service normalization (double): {e}")
+
+            return duration_slots, normalized_service
+
+        proc1 = response.procedure
+        proc2 = response.second_procedure or response.procedure
+
+        dur1_slots, svc1 = await _duration_and_name(proc1)
+        dur2_slots, svc2 = await _duration_and_name(proc2)
+
+        # 3) Проверка доступности слотов в Google Sheets отдельно для каждого мастера
+        if not await self.sheets_service.is_slot_available_in_sheets_async(specialist1, date1, time1):
+            return {"success": False, "message": f"Мастер {specialist1} занят на {time1.strftime('%H:%M')}"}
+        if not await self.sheets_service.is_slot_available_in_sheets_async(specialist2, date2, time2):
+            return {"success": False, "message": f"Мастер {specialist2} занят на {time2.strftime('%H:%M')}"}
+
+        # 4) Создаём ДВЕ записи в БД с их собственными параметрами
         bookings = []
-        for specialist in [specialist1, specialist2]:
+        for specialist, d, t, svc, slots in [
+            (specialist1, date1, time1, svc1, dur1_slots),
+            (specialist2, date2, time2, svc2, dur2_slots),
+        ]:
             booking = Booking(
                 project_id=self.project_config.project_id,
                 specialist_name=specialist,
-                appointment_date=booking_date,
-                appointment_time=booking_time,
+                appointment_date=d,
+                appointment_time=t,
                 client_id=client_id,
                 client_name=response.name,
-                service_name=response.procedure,
+                service_name=svc,
                 client_phone=response.phone,
-                duration_minutes=60,  # Стандартная длительность
+                duration_minutes=slots * 30,
                 status="active"
             )
             self.db.add(booking)
@@ -1093,23 +1122,22 @@ class BookingService:
 
         self.db.commit()
 
-        # Обновить Google Sheets для ОБОИХ мастеров
+        # 5) Обновляем Google Sheets для КАЖДОГО мастера (каждый в свой лист)
         for booking in bookings:
             await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
 
-        # Добавить в Make.com таблицу
-        make_booking_data = {
-            'date': booking_date.strftime("%d.%m.%Y"),
-            'client_id': contact_send_id if contact_send_id else client_id,
-            'time': booking_time.strftime('%H:%M'),
-            'client_name': response.name or "Клиент",
-            'service': f"{response.procedure} (двойная запись)",
-            'specialist': f"{specialist1} + {specialist2}"
-        }
-        await self.sheets_service.add_booking_to_make_table_async(make_booking_data)
-
+        # 6) Отдаём результат
         return {
             "success": True,
-            "message": f"Двойная запись создана: {specialist1} + {specialist2}",
-            "booking_ids": [b.id for b in bookings]
+            "message": "Две записи созданы",
+            "bookings": [
+                {
+                    "specialist": b.specialist_name,
+                    "date": b.appointment_date.strftime("%d.%m.%Y"),
+                    "time": b.appointment_time.strftime("%H:%M"),
+                    "service": b.service_name,
+                    "duration_min": b.duration_minutes,
+                } for b in bookings
+            ]
         }
+
