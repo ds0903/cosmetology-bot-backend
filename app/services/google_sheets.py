@@ -890,45 +890,103 @@ class GoogleSheetsService:
             logger.warning("Cannot clear booking slot: no spreadsheet connection")
             return False
         
-        logger.info(f"Clearing booking slot for {specialist_name}: {booking_date} {booking_time} (duration: {duration_slots} slots)")
+        logger.info(f"🔍 CLEAR SLOT DEBUG: Starting clear for {specialist_name}: {booking_date} {booking_time} (duration: {duration_slots} slots)")
         
         try:
             # Get worksheet for specialist
             try:
                 worksheet = self.spreadsheet.worksheet(specialist_name)
+                logger.info(f"🔍 CLEAR SLOT DEBUG: Found worksheet for {specialist_name}")
             except gspread.WorksheetNotFound:
-                logger.warning(f"Worksheet not found for specialist: {specialist_name}")
+                logger.warning(f"🔍 CLEAR SLOT DEBUG: Worksheet not found for specialist: {specialist_name}")
                 return False
             
             # Find the correct row for this time slot
             target_row = self._find_row_for_time_slot(worksheet, booking_date, booking_time)
+            logger.info(f"🔍 CLEAR SLOT DEBUG: Target row found: {target_row}")
             
             if target_row:
-                # Clear booking data columns (D, E, F, G) for all slots
+                # КРИТИЧНО: Спочатку перевіримо що там зараз записано
+                try:
+                    # Читаємо поточні дані з рядка ПЕРЕД очищенням
+                    current_client_id = worksheet.cell(target_row, 4).value  # Column D
+                    current_client_name = worksheet.cell(target_row, 5).value  # Column E
+                    current_service = worksheet.cell(target_row, 6).value  # Column F
+                    current_phone = worksheet.cell(target_row, 7).value  # Column G
+                    
+                    logger.info(f"🔍 CLEAR SLOT DEBUG: Current data in row {target_row}:")
+                    logger.info(f"  D (client_id): '{current_client_id}'")
+                    logger.info(f"  E (name): '{current_client_name}'")
+                    logger.info(f"  F (service): '{current_service}'")
+                    logger.info(f"  G (phone): '{current_phone}'")
+                    
+                    # Перевіряємо чи дійсно є що очищати
+                    has_data = any([
+                        current_client_id and str(current_client_id).strip(),
+                        current_client_name and str(current_client_name).strip(),
+                        current_service and str(current_service).strip(),
+                        current_phone and str(current_phone).strip()
+                    ])
+                    
+                    logger.info(f"🔍 CLEAR SLOT DEBUG: Row has data to clear: {has_data}")
+                    
+                except Exception as read_error:
+                    logger.error(f"🔍 CLEAR SLOT DEBUG: Error reading current data: {read_error}")
+                
+                # Тепер очищуємо
                 empty_data = ["", "", "", ""]  # Empty client_id, name, service, phone
                 
                 # Clear the main slot
                 range_update = f'D{target_row}:G{target_row}'
+                logger.info(f"🔍 CLEAR SLOT DEBUG: Clearing main slot - range: {range_update}")
                 worksheet.update(range_update, [empty_data])
-                logger.debug(f"Cleared main booking slot at row {target_row}")
+                logger.info(f"🔍 CLEAR SLOT DEBUG: Main booking slot cleared at row {target_row}")
                 
                 # If this is a multi-slot booking, clear additional slots
                 if duration_slots > 1:
-                    logger.info(f"Clearing additional {duration_slots - 1} slots for multi-slot booking")
+                    logger.info(f"🔍 CLEAR SLOT DEBUG: Clearing additional {duration_slots - 1} slots for multi-slot booking")
                     for i in range(1, duration_slots):
                         additional_row = target_row + i
                         additional_range = f'D{additional_row}:G{additional_row}'
+                        logger.info(f"🔍 CLEAR SLOT DEBUG: Clearing additional slot - range: {additional_range}")
                         worksheet.update(additional_range, [empty_data])
-                        logger.debug(f"  Cleared additional slot at row {additional_row}")
+                        logger.info(f"🔍 CLEAR SLOT DEBUG: Cleared additional slot at row {additional_row}")
                 
-                logger.info(f"Successfully cleared booking slot(s) starting at row {target_row} for {specialist_name} ({duration_slots} slots total)")
+                # КРИТИЧНО: Перевіряємо результат після очищення
+                try:
+                    # Читаємо дані після очищення
+                    after_client_id = worksheet.cell(target_row, 4).value
+                    after_client_name = worksheet.cell(target_row, 5).value
+                    after_service = worksheet.cell(target_row, 6).value
+                    after_phone = worksheet.cell(target_row, 7).value
+                    
+                    logger.info(f"🔍 CLEAR SLOT DEBUG: Data after clearing row {target_row}:")
+                    logger.info(f"  D (client_id): '{after_client_id}'")
+                    logger.info(f"  E (name): '{after_client_name}'")
+                    logger.info(f"  F (service): '{after_service}'")
+                    logger.info(f"  G (phone): '{after_phone}'")
+                    
+                    # Перевіряємо чи дійсно очищено
+                    is_cleared = not any([
+                        after_client_id and str(after_client_id).strip(),
+                        after_client_name and str(after_client_name).strip(),
+                        after_service and str(after_service).strip(),
+                        after_phone and str(after_phone).strip()
+                    ])
+                    
+                    logger.info(f"🔍 CLEAR SLOT DEBUG: Row successfully cleared: {is_cleared}")
+                    
+                except Exception as verify_error:
+                    logger.error(f"🔍 CLEAR SLOT DEBUG: Error verifying clear result: {verify_error}")
+                
+                logger.info(f"🔍 CLEAR SLOT DEBUG: ✅ Successfully cleared booking slot(s) starting at row {target_row} for {specialist_name} ({duration_slots} slots total)")
                 return True
             else:
-                logger.error(f"Could not find row for time slot {booking_time} on {booking_date}")
+                logger.error(f"🔍 CLEAR SLOT DEBUG: ❌ Could not find row for time slot {booking_time} on {booking_date}")
                 return False
                 
         except Exception as e:
-            logger.error(f"Error clearing booking slot for {specialist_name}: {e}", exc_info=True)
+            logger.error(f"🔍 CLEAR SLOT DEBUG: ❌ Error clearing booking slot for {specialist_name}: {e}", exc_info=True)
             return False
 
     async def is_slot_available_in_sheets_async(

@@ -863,15 +863,21 @@ class BookingService:
             # *** ВИПРАВЛЕННЯ: Очищаємо старі слоти ВИКОРИСТОВУЮЧИ ЗБЕРЕЖЕНІ ДАНІ ***
             for i, old_slot_data in enumerate(old_data):
                 try:
+                    logger.info(f"🔧 TRANSFER DEBUG: About to clear old slot {i+1}/{len(old_data)}:")
+                    logger.info(f"  Specialist: {old_slot_data['specialist']}")
+                    logger.info(f"  Date: {old_slot_data['date']}")
+                    logger.info(f"  Time: {old_slot_data['time']}")
+                    logger.info(f"  Duration: {old_slot_data['duration_slots']} slots")
+                    
                     await self.sheets_service.clear_booking_slot_async(
                         old_slot_data["specialist"],    # СТАРИЙ спеціаліст
                         old_slot_data["date"],           # СТАРА дата  
                         old_slot_data["time"],           # СТАРИЙ час
                         old_slot_data["duration_slots"]  # СТАРА тривалість
                     )
-                    logger.info(f"Message ID: {message_id} - Successfully cleared OLD slot: {old_slot_data['specialist']} at {old_slot_data['date']} {old_slot_data['time']}")
+                    logger.info(f"🔧 TRANSFER DEBUG: ✅ Successfully cleared OLD slot: {old_slot_data['specialist']} at {old_slot_data['date']} {old_slot_data['time']}")
                 except Exception as clear_error:
-                    logger.error(f"Message ID: {message_id} - Failed to clear old slot for {old_slot_data['specialist']}: {clear_error}")
+                    logger.error(f"🔧 TRANSFER DEBUG: ❌ Failed to clear old slot for {old_slot_data['specialist']}: {clear_error}")
                     # Продовжуємо, навіть якщо не вдалося очистити один слот
 
             # Тепер безпечно оновлюємо записи з НОВИМ часом і процедурами
