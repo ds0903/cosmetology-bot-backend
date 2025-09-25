@@ -848,35 +848,38 @@ class BookingService:
                     "message": f"Новое время занято: {', '.join(occupied_specialists)}"
                 }
 
-            # Сохранить старые данные для логирования
+            # *** ВИПРАВЛЕННЯ: Зберігаємо старі дані ПЕРЕД зміною booking об'єктів! ***
             old_data = []
             for booking in bookings_to_change:
                 old_data.append({
                     "specialist": booking.specialist_name,
                     "date": booking.appointment_date,
                     "time": booking.appointment_time,
-                    "duration_slots": booking.duration_minutes // 30
+                    "duration_slots": booking.duration_minutes // 30,
+                    "service_name": booking.service_name  # Додаємо назву послуги для логування
                 })
+                logger.info(f"Message ID: {message_id} - Saved OLD data: {booking.specialist_name} at {booking.appointment_date} {booking.appointment_time}")
 
-            # Очистить старые слоты ВИКОРИСТОВУЮЧИ ЗБЕРЕЖЕНІ СТАРІ ДАНІ
-            for i, booking in enumerate(bookings_to_change):
+            # *** ВИПРАВЛЕННЯ: Очищаємо старі слоти ВИКОРИСТОВУЮЧИ ЗБЕРЕЖЕНІ ДАНІ ***
+            for i, old_slot_data in enumerate(old_data):
                 try:
-                    # ВИКОРИСТОВУЄМО old_data[i] замість booking для очищення старих слотів!
                     await self.sheets_service.clear_booking_slot_async(
-                        old_data[i]["specialist"],  # СТАРИЙ спеціаліст
-                        old_data[i]["date"],         # СТАРА дата
-                        old_data[i]["time"],         # СТАРИЙ час
-                        old_data[i]["duration_slots"]  # СТАРА тривалість
+                        old_slot_data["specialist"],    # СТАРИЙ спеціаліст
+                        old_slot_data["date"],           # СТАРА дата  
+                        old_slot_data["time"],           # СТАРИЙ час
+                        old_slot_data["duration_slots"]  # СТАРА тривалість
                     )
-                    logger.info(f"Message ID: {message_id} - Cleared OLD slot: {old_data[i]['specialist']} at {old_data[i]['date']} {old_data[i]['time']}")
-                except Exception as e:
-                    logger.error(f"Message ID: {message_id} - Failed to clear old slot: {e}")
+                    logger.info(f"Message ID: {message_id} - Successfully cleared OLD slot: {old_slot_data['specialist']} at {old_slot_data['date']} {old_slot_data['time']}")
+                except Exception as clear_error:
+                    logger.error(f"Message ID: {message_id} - Failed to clear old slot for {old_slot_data['specialist']}: {clear_error}")
+                    # Продовжуємо, навіть якщо не вдалося очистити один слот
 
-            # Обновить записи с РАЗНЫМ временем и процедурами
+            # Тепер безпечно оновлюємо записи з НОВИМ часом і процедурами
             new_times = [new_time1, new_time2]
             new_procedures = [new_procedure1, new_procedure2]
             
             for i, booking in enumerate(bookings_to_change):
+                # Оновлюємо дані запису
                 booking.appointment_date = new_date
                 booking.appointment_time = new_times[i]
                 booking.service_name = new_procedures[i]
@@ -884,18 +887,25 @@ class BookingService:
                 booking.client_phone = response.phone or booking.client_phone
                 booking.updated_at = datetime.utcnow()
                 
-                # Обновить длительность если процедура изменилась
+                # Обновляємо тривалість якщо процедура змінилася
                 if new_procedures[i] in self.project_config.services:
                     duration_slots = self.project_config.services[new_procedures[i]]
                     booking.duration_minutes = duration_slots * 30
+                    logger.info(f"Message ID: {message_id} - Updated duration for {booking.specialist_name}: {duration_slots} slots ({duration_slots * 30} min)")
 
+            # Зберігаємо зміни в базі даних
             self.db.commit()
+            logger.info(f"Message ID: {message_id} - Database updated with new booking data")
 
-            # Обновить Google Sheets для ОБОИХ мастеров
+            # Створюємо НОВІ слоти в Google Sheets для ОБОИХ мастерів
             for booking in bookings_to_change:
-                await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
+                try:
+                    await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
+                    logger.info(f"Message ID: {message_id} - Created NEW slot: {booking.specialist_name} at {booking.appointment_date} {booking.appointment_time}")
+                except Exception as update_error:
+                    logger.error(f"Message ID: {message_id} - Failed to create new slot for {booking.specialist_name}: {update_error}")
 
-            # Логировать перенос
+            # Логуємо перенос для кожного мастера
             for i, booking in enumerate(bookings_to_change):
                 try:
                     transfer_data = {
@@ -911,17 +921,25 @@ class BookingService:
                         "new_specialist": booking.specialist_name
                     }
                     await self.sheets_service.log_transfer(transfer_data)
+                    logger.info(f"Message ID: {message_id} - Transfer logged for {booking.specialist_name}")
                 except Exception as log_error:
-                    logger.error(f"Message ID: {message_id} - Failed to log transfer: {log_error}")
+                    logger.error(f"Message ID: {message_id} - Failed to log transfer for {booking.specialist_name}: {log_error}")
+
+            # Формуємо підсумкове повідомлення про успішний перенос
+            details = []
+            for i, booking in enumerate(bookings_to_change):
+                old_time_str = old_data[i]["time"].strftime('%H:%M')
+                new_time_str = new_times[i].strftime('%H:%M')
+                details.append(f"{booking.specialist_name}: {old_time_str}→{new_time_str} ({booking.service_name})")
 
             return {
                 "success": True,
-                "message": f"Двойная запись перенесена: {specialist1} ({new_procedure1} в {new_time1.strftime('%H:%M')}) + {specialist2} ({new_procedure2} в {new_time2.strftime('%H:%M')})",
+                "message": f"Двойная запись перенесена: {' + '.join(details)}",
                 "booking_ids": [b.id for b in bookings_to_change]
             }
 
         except Exception as e:
-            logger.error(f"Message ID: {message_id} - Error changing double booking: {e}")
+            logger.error(f"Message ID: {message_id} - Error changing double booking: {e}", exc_info=True)
             return {
                 "success": False,
                 "message": f"Ошибка при переносе двойной записи: {str(e)}"
