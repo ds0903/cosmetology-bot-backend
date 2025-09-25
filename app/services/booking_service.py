@@ -765,38 +765,83 @@ class BookingService:
                     "message": "Недостаточно специалистов для переноса двойной записи"
                 }
 
+            # ИСПРАВЛЕНИЕ: Используем дату из клиентского запроса для поиска исходных записей
+            # Нужно найти записи, которые клиент хочет перенести
+            source_date = None
+            
+            # Проверяем наличие date_reject (старая дата, откуда переносим)
+            if hasattr(response, 'date_reject') and response.date_reject:
+                source_date = self._parse_date(response.date_reject)
+                logger.info(f"Message ID: {message_id} - Looking for bookings to transfer FROM date: {source_date}")
+            else:
+                # Если date_reject не указан, пытаемся определить исходную дату из контекста
+                # Возможно, нужно искать записи из диалога или использовать другую логику
+                logger.warning(f"Message ID: {message_id} - No date_reject specified, will search for most recent bookings for each specialist")
+
             # Найти существующие записи ПО ИМЕНАМ МАСТЕРОВ из specialists_list
             specialist1, specialist2 = response.specialists_list[0], response.specialists_list[1]
             
-            # Найти запись для первого мастера
-            booking1 = self.db.query(Booking).filter(
-                and_(
-                    Booking.project_id == self.project_config.project_id,
-                    Booking.client_id == client_id,
-                    Booking.specialist_name == specialist1,
-                    Booking.status == "active"
-                )
-            ).first()
-            
-            # Найти запись для второго мастера
-            booking2 = self.db.query(Booking).filter(
-                and_(
-                    Booking.project_id == self.project_config.project_id,
-                    Booking.client_id == client_id,
-                    Booking.specialist_name == specialist2,
-                    Booking.status == "active"
-                )
-            ).first()
+            # ИСПРАВЛЕНИЕ: Улучшенный поиск записей с обязательной проверкой даты
+            if source_date:
+                # Если у нас есть конкретная дата - ищем точно по ней
+                booking1 = self.db.query(Booking).filter(
+                    and_(
+                        Booking.project_id == self.project_config.project_id,
+                        Booking.client_id == client_id,
+                        Booking.specialist_name == specialist1,
+                        Booking.appointment_date == source_date,  # ОБЯЗАТЕЛЬНО по дате!
+                        Booking.status == "active"
+                    )
+                ).first()
+                
+                booking2 = self.db.query(Booking).filter(
+                    and_(
+                        Booking.project_id == self.project_config.project_id,
+                        Booking.client_id == client_id,
+                        Booking.specialist_name == specialist2,
+                        Booking.appointment_date == source_date,  # ОБЯЗАТЕЛЬНО по дате!
+                        Booking.status == "active"
+                    )
+                ).first()
+                
+                logger.info(f"Message ID: {message_id} - Looking for bookings on specific date {source_date}: {specialist1}={booking1 is not None}, {specialist2}={booking2 is not None}")
+            else:
+                # Если даты нет - ищем самые свежие активные записи для каждого мастера
+                booking1 = self.db.query(Booking).filter(
+                    and_(
+                        Booking.project_id == self.project_config.project_id,
+                        Booking.client_id == client_id,
+                        Booking.specialist_name == specialist1,
+                        Booking.status == "active"
+                    )
+                ).order_by(Booking.appointment_date.desc()).first()
+                
+                booking2 = self.db.query(Booking).filter(
+                    and_(
+                        Booking.project_id == self.project_config.project_id,
+                        Booking.client_id == client_id,
+                        Booking.specialist_name == specialist2,
+                        Booking.status == "active"
+                    )
+                ).order_by(Booking.appointment_date.desc()).first()
+                
+                logger.info(f"Message ID: {message_id} - Looking for most recent bookings: {specialist1}={booking1.appointment_date if booking1 else None}, {specialist2}={booking2.appointment_date if booking2 else None}")
 
             if not booking1 or not booking2:
                 missing = []
                 if not booking1:
-                    missing.append(specialist1)
+                    if source_date:
+                        missing.append(f"{specialist1} на {source_date.strftime('%d.%m.%Y')}")
+                    else:
+                        missing.append(f"{specialist1} (нет активных записей)")
                 if not booking2:
-                    missing.append(specialist2)
+                    if source_date:
+                        missing.append(f"{specialist2} на {source_date.strftime('%d.%m.%Y')}")
+                    else:
+                        missing.append(f"{specialist2} (нет активных записей)")
                 return {
                     "success": False,
-                    "message": f"Не найдены активные записи у мастера(ов): {', '.join(missing)}"
+                    "message": f"Не найдены записи для переноса у: {', '.join(missing)}"
                 }
 
             bookings_to_change = [booking1, booking2]
