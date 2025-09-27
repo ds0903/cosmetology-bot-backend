@@ -758,58 +758,52 @@ class BookingService:
     async def _change_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
         str, Any]:
         """Change a double booking"""
-        logger.info(f"🔧 TRANSFER DEBUG: _change_double_booking START for message_id={message_id}, client_id={client_id}")
-        logger.info(f"🔧 TRANSFER DEBUG: Input response: double_booking={response.double_booking}, specialists_list={response.specialists_list}")
-        logger.info(f"🔧 TRANSFER DEBUG: date_order={response.date_order}, date_reject={response.date_reject}")
-        try:
-            if not response.specialists_list or len(response.specialists_list) < 2:
-                return {
-                    "success": False,
-                    "message": "Недостаточно специалистов для переноса двойной записи"
-                }
+        logger.info(
+            f"🔧 TRANSFER DEBUG: _change_double_booking START for message_id={message_id}, client_id={client_id}")
 
-            # ИСПРАВЛЕНИЕ: Используем дату из клиентского запроса для поиска исходных записей
-            # Нужно найти записи, которые клиент хочет перенести
+        try:
+            # 🔒 Перевірка базових даних з Claude
+            if not response or not isinstance(response, ClaudeMainResponse):
+                return {"success": False, "message": "Некорректный ответ от нейросети"}
+
+            if not response.specialists_list or len(response.specialists_list) < 2:
+                return {"success": False, "message": "Недостаточно специалистов для переноса двойной записи"}
+
+            if not getattr(response, "date_order", None):
+                return {"success": False, "message": "Не указана новая дата для переноса"}
+
+            # Ініціалізація дати, з якої переносимо
             source_date = None
-            
-            # Проверяем наличие date_reject (старая дата, откуда переносим)
-            if hasattr(response, 'date_reject') and response.date_reject:
+            if getattr(response, "date_reject", None):
                 source_date = self._parse_date(response.date_reject)
                 logger.info(f"Message ID: {message_id} - Looking for bookings to transfer FROM date: {source_date}")
             else:
-                # Если date_reject не указан, пытаемся определить исходную дату из контекста
-                # Возможно, нужно искать записи из диалога или использовать другую логику
-                logger.warning(f"Message ID: {message_id} - No date_reject specified, will search for most recent bookings for each specialist")
+                logger.warning(
+                    f"Message ID: {message_id} - No date_reject specified, will search latest active bookings")
 
-            # Найти существующие записи ПО ИМЕНАМ МАСТЕРОВ из specialists_list
             specialist1, specialist2 = response.specialists_list[0], response.specialists_list[1]
-            
-            # ИСПРАВЛЕНИЕ: Улучшенный поиск записей с обязательной проверкой даты
+
+            # 🔍 Пошук вихідних записів
             if source_date:
-                # Если у нас есть конкретная дата - ищем точно по ней
                 booking1 = self.db.query(Booking).filter(
                     and_(
                         Booking.project_id == self.project_config.project_id,
                         Booking.client_id == client_id,
                         Booking.specialist_name == specialist1,
-                        Booking.appointment_date == source_date,  # ОБЯЗАТЕЛЬНО по дате!
+                        Booking.appointment_date == source_date,
                         Booking.status == "active"
                     )
                 ).first()
-                
                 booking2 = self.db.query(Booking).filter(
                     and_(
                         Booking.project_id == self.project_config.project_id,
                         Booking.client_id == client_id,
                         Booking.specialist_name == specialist2,
-                        Booking.appointment_date == source_date,  # ОБЯЗАТЕЛЬНО по дате!
+                        Booking.appointment_date == source_date,
                         Booking.status == "active"
                     )
                 ).first()
-                
-                logger.info(f"Message ID: {message_id} - Looking for bookings on specific date {source_date}: {specialist1}={booking1 is not None}, {specialist2}={booking2 is not None}")
             else:
-                # Если даты нет - ищем самые свежие активные записи для каждого мастера
                 booking1 = self.db.query(Booking).filter(
                     and_(
                         Booking.project_id == self.project_config.project_id,
@@ -818,7 +812,6 @@ class BookingService:
                         Booking.status == "active"
                     )
                 ).order_by(Booking.appointment_date.desc()).first()
-                
                 booking2 = self.db.query(Booking).filter(
                     and_(
                         Booking.project_id == self.project_config.project_id,
@@ -827,76 +820,53 @@ class BookingService:
                         Booking.status == "active"
                     )
                 ).order_by(Booking.appointment_date.desc()).first()
-                
-                logger.info(f"Message ID: {message_id} - Looking for most recent bookings: {specialist1}={booking1.appointment_date if booking1 else None}, {specialist2}={booking2.appointment_date if booking2 else None}")
 
             if not booking1 or not booking2:
                 missing = []
                 if not booking1:
-                    if source_date:
-                        missing.append(f"{specialist1} на {source_date.strftime('%d.%m.%Y')}")
-                    else:
-                        missing.append(f"{specialist1} (нет активных записей)")
+                    missing.append(
+                        f"{specialist1} ({'нет активных записей' if not source_date else source_date.strftime('%d.%m.%Y')})")
                 if not booking2:
-                    if source_date:
-                        missing.append(f"{specialist2} на {source_date.strftime('%d.%m.%Y')}")
-                    else:
-                        missing.append(f"{specialist2} (нет активных записей)")
-                return {
-                    "success": False,
-                    "message": f"Не найдены записи для переноса у: {', '.join(missing)}"
-                }
+                    missing.append(
+                        f"{specialist2} ({'нет активных записей' if not source_date else source_date.strftime('%d.%m.%Y')})")
+                return {"success": False, "message": f"Не найдены записи для переноса у: {', '.join(missing)}"}
 
             bookings_to_change = [booking1, booking2]
 
-            # Parse new date
+            # Нова дата
             new_date = self._parse_date(response.date_order)
             if not new_date:
-                return {
-                    "success": False,
-                    "message": "Неверный формат новой даты"
-                }
+                return {"success": False, "message": "Неверный формат новой даты"}
 
-            # Извлекаем время для КАЖДОГО мастера отдельно
-            times_list = getattr(response, 'times_set_up_list', None)
+            # Нові часи
+            times_list = getattr(response, "times_set_up_list", None)
             if times_list and len(times_list) >= 2:
                 new_time1 = self._parse_time(times_list[0])
                 new_time2 = self._parse_time(times_list[1])
-                logger.info(f"Message ID: {message_id} - Changing to different times: {specialist1} at {times_list[0]}, {specialist2} at {times_list[1]}")
             else:
-                # Если список времен не предоставлен, используем старое время каждой записи
-                new_time1 = booking1.appointment_time
-                new_time2 = booking2.appointment_time
-                logger.info(f"Message ID: {message_id} - No times_set_up_list, keeping original times")
-            
-            # Извлекаем процедуры для КАЖДОГО мастера отдельно
-            procedures_list = getattr(response, 'procedures_list', None)
+                new_time1, new_time2 = booking1.appointment_time, booking2.appointment_time
+
+            # Нові процедури
+            procedures_list = getattr(response, "procedures_list", None)
             if procedures_list and len(procedures_list) >= 2:
-                new_procedure1 = procedures_list[0]
-                new_procedure2 = procedures_list[1]
-                logger.info(f"Message ID: {message_id} - Changing to different procedures: {new_procedure1}, {new_procedure2}")
+                new_procedure1, new_procedure2 = procedures_list[0], procedures_list[1]
             else:
-                # Если список процедур не предоставлен, оставляем старые процедуры
-                new_procedure1 = booking1.service_name
-                new_procedure2 = booking2.service_name
-                logger.info(f"Message ID: {message_id} - No procedures_list, keeping original procedures")
+                new_procedure1, new_procedure2 = booking1.service_name, booking2.service_name
 
-            # Проверить доступность новых слотов для ОБОИХ мастеров
-            slot1_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist1, new_date, new_time1)
-            slot2_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist2, new_date, new_time2)
-
+            # Перевірка доступності слотів
+            slot1_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist1, new_date,
+                                                                                          new_time1)
+            slot2_available = await self.sheets_service.is_slot_available_in_sheets_async(specialist2, new_date,
+                                                                                          new_time2)
             if not slot1_available or not slot2_available:
-                occupied_specialists = []
+                occupied = []
                 if not slot1_available:
-                    occupied_specialists.append(f"{specialist1} на {new_time1.strftime('%H:%M')}")
+                    occupied.append(f"{specialist1} на {new_time1.strftime('%H:%M')}")
                 if not slot2_available:
-                    occupied_specialists.append(f"{specialist2} на {new_time2.strftime('%H:%M')}")
-                return {
-                    "success": False,
-                    "message": f"Новое время занято: {', '.join(occupied_specialists)}"
-                }
+                    occupied.append(f"{specialist2} на {new_time2.strftime('%H:%M')}")
+                return {"success": False, "message": f"Новое время занято: {', '.join(occupied)}"}
 
-            # *** ВИПРАВЛЕННЯ: Зберігаємо старі дані ПЕРЕД зміною booking об'єктів! ***
+            # Збереження старих даних
             old_data = []
             for booking in bookings_to_change:
                 old_data.append({
@@ -904,62 +874,46 @@ class BookingService:
                     "date": booking.appointment_date,
                     "time": booking.appointment_time,
                     "duration_slots": booking.duration_minutes // 30,
-                    "service_name": booking.service_name  # Додаємо назву послуги для логування
+                    "service_name": booking.service_name
                 })
-                logger.info(f"Message ID: {message_id} - Saved OLD data: {booking.specialist_name} at {booking.appointment_date} {booking.appointment_time}")
 
-            # *** ВИПРАВЛЕННЯ: Очищаємо старі слоти ВИКОРИСТОВУЮЧИ ЗБЕРЕЖЕНІ ДАНІ ***
-            for i, old_slot_data in enumerate(old_data):
+            # Очищення старих слотів
+            for old_slot_data in old_data:
                 try:
-                    logger.info(f"🔧 TRANSFER DEBUG: About to clear old slot {i+1}/{len(old_data)}:")
-                    logger.info(f"  Specialist: {old_slot_data['specialist']}")
-                    logger.info(f"  Date: {old_slot_data['date']}")
-                    logger.info(f"  Time: {old_slot_data['time']}")
-                    logger.info(f"  Duration: {old_slot_data['duration_slots']} slots")
-                    
                     await self.sheets_service.clear_booking_slot_async(
-                        old_slot_data["specialist"],    # СТАРИЙ спеціаліст
-                        old_slot_data["date"],           # СТАРА дата  
-                        old_slot_data["time"],           # СТАРИЙ час
-                        old_slot_data["duration_slots"]  # СТАРА тривалість
+                        old_slot_data["specialist"],
+                        old_slot_data["date"],
+                        old_slot_data["time"],
+                        old_slot_data["duration_slots"]
                     )
-                    logger.info(f"🔧 TRANSFER DEBUG: ✅ Successfully cleared OLD slot: {old_slot_data['specialist']} at {old_slot_data['date']} {old_slot_data['time']}")
-                except Exception as clear_error:
-                    logger.error(f"🔧 TRANSFER DEBUG: ❌ Failed to clear old slot for {old_slot_data['specialist']}: {clear_error}")
-                    # Продовжуємо, навіть якщо не вдалося очистити один слот
+                except Exception as e:
+                    logger.error(f"Message ID: {message_id} - Failed to clear old slot: {e}")
 
-            # Тепер безпечно оновлюємо записи з НОВИМ часом і процедурами
+            # Оновлення об’єктів у БД
             new_times = [new_time1, new_time2]
             new_procedures = [new_procedure1, new_procedure2]
-            
             for i, booking in enumerate(bookings_to_change):
-                # Оновлюємо дані запису
                 booking.appointment_date = new_date
                 booking.appointment_time = new_times[i]
                 booking.service_name = new_procedures[i]
                 booking.client_name = response.name or booking.client_name
                 booking.client_phone = response.phone or booking.client_phone
                 booking.updated_at = datetime.utcnow()
-                
-                # Обновляємо тривалість якщо процедура змінилася
+
                 if new_procedures[i] in self.project_config.services:
                     duration_slots = self.project_config.services[new_procedures[i]]
                     booking.duration_minutes = duration_slots * 30
-                    logger.info(f"Message ID: {message_id} - Updated duration for {booking.specialist_name}: {duration_slots} slots ({duration_slots * 30} min)")
 
-            # Зберігаємо зміни в базі даних
             self.db.commit()
-            logger.info(f"Message ID: {message_id} - Database updated with new booking data")
 
-            # Створюємо НОВІ слоти в Google Sheets для ОБОИХ мастерів
+            # Створення нових слотів у Sheets
             for booking in bookings_to_change:
                 try:
                     await self.sheets_service.update_single_booking_slot_async(booking.specialist_name, booking)
-                    logger.info(f"Message ID: {message_id} - Created NEW slot: {booking.specialist_name} at {booking.appointment_date} {booking.appointment_time}")
-                except Exception as update_error:
-                    logger.error(f"Message ID: {message_id} - Failed to create new slot for {booking.specialist_name}: {update_error}")
+                except Exception as e:
+                    logger.error(f"Message ID: {message_id} - Failed to create new slot: {e}")
 
-            # Логуємо перенос для кожного мастера
+            # Логування переносу
             for i, booking in enumerate(bookings_to_change):
                 try:
                     transfer_data = {
@@ -975,34 +929,22 @@ class BookingService:
                         "new_specialist": booking.specialist_name
                     }
                     await self.sheets_service.log_transfer(transfer_data)
-                    logger.info(f"Message ID: {message_id} - Transfer logged for {booking.specialist_name}")
-                except Exception as log_error:
-                    logger.error(f"Message ID: {message_id} - Failed to log transfer for {booking.specialist_name}: {log_error}")
+                except Exception as e:
+                    logger.error(f"Message ID: {message_id} - Failed to log transfer: {e}")
 
-            # Формуємо підсумкове повідомлення про успішний перенос
             details = []
             for i, booking in enumerate(bookings_to_change):
-                old_time_str = old_data[i]["time"].strftime('%H:%M')
-                new_time_str = new_times[i].strftime('%H:%M')
-                details.append(f"{booking.specialist_name}: {old_time_str}→{new_time_str} ({booking.service_name})")
+                details.append(
+                    f"{booking.specialist_name}: {old_data[i]['time'].strftime('%H:%M')}→{new_times[i].strftime('%H:%M')} ({booking.service_name})"
+                )
 
-            result = {
-                "success": True,
-                "message": f"Двойная запись перенесена: {' + '.join(details)}",
-                "booking_ids": [b.id for b in bookings_to_change]
-            }
-            logger.info(f"🔧 TRANSFER DEBUG: _change_double_booking SUCCESS for message_id={message_id}")
-            logger.info(f"🔧 TRANSFER DEBUG: Returning result: {result}")
-            return result
+            return {"success": True, "message": f"Двойная запись перенесена: {' + '.join(details)}",
+                    "booking_ids": [b.id for b in bookings_to_change]}
 
         except Exception as e:
-            logger.error(f"🔧 TRANSFER DEBUG: _change_double_booking EXCEPTION for message_id={message_id}: {e}", exc_info=True)
-            result = {
-                "success": False,
-                "message": f"Ошибка при переносе двойной записи: {str(e)}"
-            }
-            logger.error(f"🔧 TRANSFER DEBUG: Returning error result: {result}")
-            return result
+            logger.error(f"🔧 TRANSFER DEBUG: _change_double_booking EXCEPTION for message_id={message_id}: {e}",
+                         exc_info=True)
+            return {"success": False, "message": f"Ошибка при переносе двойной записи: {str(e)}"}
 
     def _is_slot_available(self, specialist: str, booking_date: date, booking_time: time, duration_slots: int,
                            exclude_booking_id: Optional[int] = None) -> bool:
