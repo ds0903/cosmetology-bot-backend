@@ -758,6 +758,9 @@ class BookingService:
     async def _change_double_booking(self, response: ClaudeMainResponse, client_id: str, message_id: str) -> Dict[
         str, Any]:
         """Change a double booking"""
+        logger.info(f"🔧 TRANSFER DEBUG: _change_double_booking START for message_id={message_id}, client_id={client_id}")
+        logger.info(f"🔧 TRANSFER DEBUG: Input response: double_booking={response.double_booking}, specialists_list={response.specialists_list}")
+        logger.info(f"🔧 TRANSFER DEBUG: date_order={response.date_order}, date_reject={response.date_reject}")
         try:
             if not response.specialists_list or len(response.specialists_list) < 2:
                 return {
@@ -983,18 +986,23 @@ class BookingService:
                 new_time_str = new_times[i].strftime('%H:%M')
                 details.append(f"{booking.specialist_name}: {old_time_str}→{new_time_str} ({booking.service_name})")
 
-            return {
+            result = {
                 "success": True,
                 "message": f"Двойная запись перенесена: {' + '.join(details)}",
                 "booking_ids": [b.id for b in bookings_to_change]
             }
+            logger.info(f"🔧 TRANSFER DEBUG: _change_double_booking SUCCESS for message_id={message_id}")
+            logger.info(f"🔧 TRANSFER DEBUG: Returning result: {result}")
+            return result
 
         except Exception as e:
-            logger.error(f"Message ID: {message_id} - Error changing double booking: {e}", exc_info=True)
-            return {
+            logger.error(f"🔧 TRANSFER DEBUG: _change_double_booking EXCEPTION for message_id={message_id}: {e}", exc_info=True)
+            result = {
                 "success": False,
                 "message": f"Ошибка при переносе двойной записи: {str(e)}"
             }
+            logger.error(f"🔧 TRANSFER DEBUG: Returning error result: {result}")
+            return result
 
     def _is_slot_available(self, specialist: str, booking_date: date, booking_time: time, duration_slots: int,
                            exclude_booking_id: Optional[int] = None) -> bool:

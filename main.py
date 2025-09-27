@@ -562,9 +562,14 @@ async def sendpulse_webhook(
             final_pic = ""  # No picture for superseded messages
             logger.info(f"Message ID: {message_id} - Message {queue_result['queue_item_id']} lost winner claim for client_id={client_id}, returning send_status=FALSE, count=None")
         
+        logger.info(f"🔧 TRANSFER DEBUG: WEBHOOK RESPONSE for message_id={message_id}:")
+        logger.info(f"🔧 TRANSFER DEBUG: - send_status: {send_status}")
+        logger.info(f"🔧 TRANSFER DEBUG: - count: {count}")
+        logger.info(f"🔧 TRANSFER DEBUG: - final_gpt_response: '{final_gpt_response}' (length: {len(final_gpt_response) if final_gpt_response else 0})")
+        logger.info(f"🔧 TRANSFER DEBUG: - final_pic: '{final_pic}'")
         logger.info(f"Message ID: {message_id} - SENDING WebhookResponse: send_status={send_status}, gpt_response length={len(final_gpt_response) if final_gpt_response else 0}, first 100 chars: {final_gpt_response[:100] if final_gpt_response else "EMPTY"}")
         # Return the final response
-        return WebhookResponse(
+        webhook_response = WebhookResponse(
             send_status=send_status,
             count=count,
             gpt_response=final_gpt_response.replace('\\n', '\n'),
@@ -572,6 +577,8 @@ async def sendpulse_webhook(
             status="200",
             user_message=message.response
         )
+        logger.info(f"🔧 TRANSFER DEBUG: FINAL WebhookResponse created: send_status={webhook_response.send_status}, count={webhook_response.count}, gpt_response='{webhook_response.gpt_response}'")
+        return webhook_response
         
     except Exception as e:
         error_count += 1
@@ -1039,27 +1046,60 @@ async def process_message_async(project_id: str, client_id: str, queue_item_id: 
             
             # Prepare final response
             final_response = main_response.gpt_response
+            
+            # 🔧 ИСПРАВЛЕНИЕ: Проверяем, что gpt_response не пустой
+            if not final_response or final_response.strip() == "":
+                logger.warning(f"Message ID: {message_id} - Empty gpt_response from Claude, using default response for client_id={client_id}")
+                # Устанавливаем дефолтный ответ в зависимости от результата операции
+                if booking_result.get("success") and booking_result.get("message"):
+                    final_response = booking_result["message"]
+                    logger.info(f"Message ID: {message_id} - Using booking result message as response: '{final_response[:50]}...'")
+                else:
+                    final_response = "Команда выполнена успешно."
+                    logger.info(f"Message ID: {message_id} - Using generic success message as fallback")
+            
+            # 🔧 DEBUG: Логуємо детально що повертається
+            logger.info(f"🔧 TRANSFER DEBUG: Final response before return for message_id={message_id}:")
+            logger.info(f"🔧 TRANSFER DEBUG: - final_response: '{final_response[:100]}...' (length: {len(final_response)})")
+            logger.info(f"🔧 TRANSFER DEBUG: - booking_result: {booking_result}")
+            logger.info(f"🔧 TRANSFER DEBUG: - main_response.pic: '{main_response.pic or 'EMPTY'}'")
+            logger.info(f"🔧 TRANSFER DEBUG: - error_count: {error_count}")
+            
             if booking_result["success"]:
                 if booking_result.get("message") and booking_result["message"] not in [None, "", "None", "No booking action required"]:
-                    final_response += f"\n\n{booking_result['message']}"
+                    # Проверяем, что booking_result message не дублируется в final_response
+                    if booking_result["message"] not in final_response:
+                        logger.info(f"🔧 TRANSFER DEBUG: Adding booking success message: '{booking_result['message']}' to final_response")
+                        final_response += f"\n\n{booking_result['message']}"
+                    else:
+                        logger.info(f"🔧 TRANSFER DEBUG: Booking message already in final_response, skipping duplication")
             elif booking_result.get("message") and booking_result["message"] not in [None, "", "None"]:
+                logger.info(f"🔧 TRANSFER DEBUG: Adding booking error message: '{booking_result['message']}' to final_response")
                 final_response += f"\n\nОшибка: {booking_result['message']}"
             
             logger.info(f"Message ID: {message_id} - Message processing completed for client_id={client_id} with {error_count} errors")
             
             # Return response data for webhook
+            logger.info(f"🔧 TRANSFER DEBUG: About to return response for message_id={message_id}:")
+            logger.info(f"🔧 TRANSFER DEBUG: - FINAL final_response: '{final_response}'")
+            logger.info(f"🔧 TRANSFER DEBUG: - error_count: {error_count}")
+            
             if error_count > 0:
-                return {
+                result_data = {
                     "error": f"Processing completed with {error_count} errors",
                     "error_count": error_count,
                     "gpt_response": final_response,
                     "pic": main_response.pic or ""
                 }
+                logger.info(f"🔧 TRANSFER DEBUG: Returning WITH ERRORS: {result_data}")
+                return result_data
             else:
-                return {
+                result_data = {
                     "gpt_response": final_response,
                     "pic": main_response.pic or ""
                 }
+                logger.info(f"🔧 TRANSFER DEBUG: Returning SUCCESS: {result_data}")
+                return result_data
             
         finally:
             db.close()

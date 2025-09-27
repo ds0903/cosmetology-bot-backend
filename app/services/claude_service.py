@@ -976,10 +976,17 @@ current_message: {current_message}"""
                 logger.info(f"Message ID: {message_id} - activate_booking={parsed_result.get('activate_booking')}")
             
             logger.debug(f"Message ID: {message_id} - Main response parsed successfully: {parsed_result}")
+            logger.info(f"🔧 TRANSFER DEBUG: Claude service returning main response:")
+            logger.info(f"🔧 TRANSFER DEBUG: - gpt_response: '{parsed_result.get('gpt_response', 'EMPTY')}' (length: {len(parsed_result.get('gpt_response', ''))})")
+            logger.info(f"🔧 TRANSFER DEBUG: - activate_booking: {parsed_result.get('activate_booking')}")
+            logger.info(f"🔧 TRANSFER DEBUG: - change_order: {parsed_result.get('change_order')}")
+            logger.info(f"🔧 TRANSFER DEBUG: - double_booking: {parsed_result.get('double_booking')}")
             return parsed_result
         except Exception as e:
             logger.error(f"Message ID: {message_id} - Failed to parse main response JSON: {e}")
             logger.warning(f"Message ID: {message_id} - Raw response was: '{response[:200]}...'")
-            return {
+            error_result = {
                 "gpt_response": "Извините, произошла ошибка. Попробуйте еще раз."
-            } 
+            }
+            logger.error(f"🔧 TRANSFER DEBUG: Claude service returning ERROR response: {error_result}")
+            return error_result 
