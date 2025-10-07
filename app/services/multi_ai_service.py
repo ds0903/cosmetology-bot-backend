@@ -36,18 +36,22 @@ class MultiAIService:
             self.claude_client = AsyncAnthropic(api_key=settings.claude_api_key_1)
             logger.info("Claude client initialized")
         
-        # OpenAI GPT o3
+        # OpenAI GPT
         self.openai_client = None
         if hasattr(settings, 'openai_api_key') and settings.openai_api_key:
             self.openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
-            logger.info("OpenAI client initialized")
+            # Зберігаємо назву моделі з .env
+            self.openai_model = getattr(settings, 'openai_model', 'gpt-4o')
+            logger.info(f"OpenAI client initialized with {self.openai_model}")
         
         # Google Gemini
         self.gemini_client = None
         if hasattr(settings, 'gemini_api_key') and settings.gemini_api_key:
             genai.configure(api_key=settings.gemini_api_key)
-            self.gemini_client = genai.GenerativeModel('gemini-2.5-pro-latest')
-            logger.info("Gemini client initialized")
+            # Зберігаємо назву моделі з .env
+            self.gemini_model = getattr(settings, 'gemini_model', 'gemini-1.5-pro-latest')
+            self.gemini_client = genai.GenerativeModel(self.gemini_model)
+            logger.info(f"Gemini client initialized with {self.gemini_model}")
         
         # xAI Grok (використовує OpenAI-сумісний API)
         self.grok_client = None
@@ -56,7 +60,9 @@ class MultiAIService:
                 api_key=settings.grok_api_key,
                 base_url="https://api.x.ai/v1"
             )
-            logger.info("Grok client initialized")
+            # Зберігаємо назву моделі з .env
+            self.grok_model = getattr(settings, 'grok_model', 'grok-beta')
+            logger.info(f"Grok client initialized with {self.grok_model}")
     
     async def send_message(
         self,
@@ -158,7 +164,7 @@ class MultiAIService:
             }
             
             payload = {
-                "model": "o3",
+                "model": self.openai_model,  # Використовуємо модель з .env
                 "input": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
@@ -187,7 +193,7 @@ class MultiAIService:
         return {
             "response": text,
             "provider": "gpt-o3",
-            "model": "o3",
+            "model": self.openai_model,  # Повертаємо реальну назву моделі
             "tokens_used": {
                 "input": tokens_in,
                 "output": tokens_out,
@@ -233,7 +239,7 @@ class MultiAIService:
         return {
             "response": text,
             "provider": "gemini",
-            "model": "gemini-2.5-pro",
+            "model": self.gemini_model,  # Повертаємо реальну назву моделі
             "tokens_used": {
                 "input": tokens_in,
                 "output": tokens_out,
@@ -255,7 +261,7 @@ class MultiAIService:
         
         # Використовуємо стандартний OpenAI chat completions формат
         response = await self.grok_client.chat.completions.create(
-            model="grok-3",
+            model=self.grok_model,  # Використовуємо модель з .env
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message}
@@ -276,7 +282,7 @@ class MultiAIService:
         return {
             "response": text,
             "provider": "grok",
-            "model": "grok-3",
+            "model": self.grok_model,  # Повертаємо реальну назву моделі
             "tokens_used": {
                 "input": input_tokens,
                 "output": output_tokens,
