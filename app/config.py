@@ -16,6 +16,15 @@ class Settings(BaseSettings):
     claude_api_key_1: str = Field(default="")
     claude_api_key_2: str = Field(default="")
     claude_model: str = Field(default="claude-sonnet-4-20250514")
+    
+    # OpenAI GPT o3
+    openai_api_key: str = Field(default="")
+    
+    # Google Gemini
+    gemini_api_key: str = Field(default="")
+    
+    # xAI Grok
+    grok_api_key: str = Field(default="")
 
     # Google Sheets
     google_credentials_file: str = Field(default="credentials.json")
