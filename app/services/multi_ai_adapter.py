@@ -255,9 +255,25 @@ class MultiAIAdapter:
             parsed = self._parse_json_response(raw_response, message_id)
             
             if parsed:
-                main_response = ClaudeMainResponse(**parsed)
-                logger.info(f"Message ID: {message_id} - Response generated, cost: ${result.get('cost_estimate', 0):.6f}")
-                return main_response
+                # CRITICAL FIX: Обробляємо різні назви полів від різних моделей
+                # Деякі моделі повертають client_response замість gpt_response (з прикладів у промпті)
+                if 'gpt_response' not in parsed and 'client_response' in parsed:
+                    logger.info(f"Message ID: {message_id} - Converting client_response to gpt_response")
+                    parsed['gpt_response'] = parsed['client_response']
+                
+                # Якщо немає ні gpt_response, ні client_response - fallback
+                if 'gpt_response' not in parsed:
+                    logger.error(f"Message ID: {message_id} - No gpt_response or client_response in parsed result: {list(parsed.keys())}")
+                    parsed['gpt_response'] = "Вибачте, сталася помилка. Спробуйте ще раз."
+                
+                try:
+                    main_response = ClaudeMainResponse(**parsed)
+                    logger.info(f"Message ID: {message_id} - Response generated, cost: ${result.get('cost_estimate', 0):.6f}")
+                    return main_response
+                except Exception as validation_error:
+                    logger.error(f"Message ID: {message_id} - Validation error: {validation_error}")
+                    logger.error(f"Message ID: {message_id} - Parsed data: {parsed}")
+                    return ClaudeMainResponse(gpt_response="Вибачте, сталася помилка. Спробуйте ще раз.")
             else:
                 return ClaudeMainResponse(gpt_response="Вибачте, сталася помилка. Спробуйте ще раз.")
                 
