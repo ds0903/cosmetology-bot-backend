@@ -143,7 +143,11 @@ class MultiAIService:
             "cost_estimate": round(cost, 6)
         }
 
-    async def _call_gpt_o3(self, system_prompt: str, user_message: str, max_tokens: int, temperature: float):
+    import httpx
+    from typing import Dict, Any
+
+    async def _call_gpt_o3(self, system_prompt: str, user_message: str, max_tokens: int, temperature: float) -> Dict[
+        str, Any]:
         if not self.openai_client:
             raise ValueError("OpenAI client not initialized. Check OPENAI_API_KEY")
 
@@ -153,56 +157,62 @@ class MultiAIService:
             "Content-Type": "application/json",
         }
 
+        # ВАЖНО: Responses API => используем "input" и type="input_text"
         payload = {
-            "model": self.openai_model,  # "o3" або "o3-mini"
+            "model": "gpt-o3",
+            "instructions": system_prompt,  # вместо отдельного system-сообщения
             "input": [
-                {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
-                {"role": "user", "content": [{"type": "input_text", "text": user_message}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": user_message}
+                    ],
+                }
             ],
-            # опційно: "reasoning": {"effort": "medium"}
+            # В Responses API лимит токенов — это max_output_tokens
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
+            # опц. для reasoning-моделей:
+            # "reasoning": {"effort": "medium"},
+            # опц. если хочешь принудительно только текст:
+            # "modalities": ["text"],
         }
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(url, headers=headers, json=payload)
-            try:
-                r.raise_for_status()
-            except httpx.HTTPStatusError:
-                # не парсимо як JSON «наосліп» — спочатку лог текст
-                raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text}") from None
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, headers=headers, json=payload)
 
-            data = r.json()
+        # Если 4xx/5xx — кинем понятную ошибку с телом ответа
+        try:
+            data = resp.json()
+        except Exception:
+            resp.raise_for_status()  # поднимет HTTPError, если не 2xx
+            # если 2xx, но тело не JSON — тоже ошибка
+            raise RuntimeError(f"Unexpected non-JSON response: {resp.text[:500]}")
 
-        # Безпечний парсинг
-        text = data.get("output_text")
-        if not text:
-            # шукаємо перший блок assistant з output_text
+        if resp.status_code >= 400:
+            # вытащим понятный фрагмент из ошибки OpenAI
+            err = data.get("error", {})
+            raise RuntimeError(
+                f"OpenAI API error {resp.status_code}: "
+                f"{err.get('message')} (param={err.get('param')}, code={err.get('code')})"
+            )
+
+        # ---------- ПАРСИНГ ОТВЕТА Responses API ----------
+        # 1) Самый простой путь: готовая склеенная строка
+        if "output_text" in data and data["output_text"]:
+            text = data["output_text"]
+        else:
+            # 2) Универсальный парсинг по фрагментам
+            chunks = []
             for item in data.get("output", []):
-                if item.get("type") == "message":
-                    for c in item.get("content", []):
-                        if c.get("type") == "output_text":
-                            text = c.get("text")
-                            break
-                if text:
-                    break
-        if not text:
-            raise RuntimeError(f"Unexpected o3 response format: {data}")
-
-        # (решта — як у тебе, оцінка токенів/вартості)
-        tokens_in = len(system_prompt.split()) + len(user_message.split())
-        tokens_out = len(text.split())
-        cost = (tokens_in * 0.000002) + (tokens_out * 0.000008)
+                for c in item.get("content", []):
+                    if c.get("type") == "output_text":
+                        chunks.append(c.get("text", ""))
+            text = "".join(chunks).strip()
 
         return {
-            "response": text,
-            "provider": "gpt-o3",
-            "model": self.openai_model,
-            "tokens_used": {
-                "input": tokens_in,
-                "output": tokens_out,
-                "total": tokens_in + tokens_out,
-                "note": "Estimated (word count)"
-            },
-            "cost_estimate": round(cost, 6)
+            "text": text,
+            "raw": data,  # опционально для отладки
         }
 
     async def _call_gemini(
