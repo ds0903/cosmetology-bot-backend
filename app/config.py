@@ -16,6 +16,21 @@ class Settings(BaseSettings):
     claude_api_key_1: str = Field(default="")
     claude_api_key_2: str = Field(default="")
     claude_model: str = Field(default="claude-sonnet-4-20250514")
+    
+    # OpenAI GPT
+    openai_api_key: str = Field(default="")
+    openai_model: str = Field(default="gpt-4o")  # або gpt-4-turbo, gpt-3.5-turbo
+    
+    # Google Gemini  
+    gemini_api_key: str = Field(default="")
+    gemini_model: str = Field(default="gemini-1.5-pro-latest")  # або gemini-1.5-flash-latest, gemini-2.0-flash-thinking-exp
+    
+    # xAI Grok
+    grok_api_key: str = Field(default="")
+    grok_model: str = Field(default="grok-beta")  # або grok-2-latest
+    
+    # Default AI Provider
+    default_ai_provider: str = Field(default="claude")  # claude, gpt-4o, gemini, grok
 
     # Google Sheets
     google_credentials_file: str = Field(default="credentials.json")

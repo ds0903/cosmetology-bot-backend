@@ -29,6 +29,8 @@ from app.services.message_queue import MessageQueueService
 from app.services.claude_service import ClaudeService
 from app.services.google_sheets import GoogleSheetsService
 from app.services.booking_service import BookingService
+from app.api_test_routes import router as ai_test_router
+from app.admin_ai_routes import router as admin_ai_router
 
 # Кеш для хранения данных pending подтверждений
 # Формат: {client_id: {"date": "...", "time": "...", "specialist": "...", "service": "...", "timestamp": ...}}
@@ -252,6 +254,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include AI test routes
+app.include_router(ai_test_router)
+
+# Include Admin AI routes (для перемикання моделей)
+app.include_router(admin_ai_router)
 
 
 @app.get("/")
@@ -623,7 +631,16 @@ async def process_message_async(project_id: str, client_id: str, queue_item_id: 
             # Initialize services
             logger.debug(f"Message ID: {message_id} - Initializing services for client_id={client_id}")
             queue_service = MessageQueueService(db)
-            claude_service = ClaudeService(db)
+            
+            # Використовуємо динамічний провайдер
+            from app.services.multi_ai_adapter import MultiAIAdapter
+            from app.services.provider_switcher import get_current_provider
+            
+            current_provider = get_current_provider()
+            logger.info(f"Message ID: {message_id} - Using AI provider: {current_provider}")
+            
+            ai_service = MultiAIAdapter(db, provider=current_provider)
+            
             sheets_service = GoogleSheetsService(project_config)
             booking_service = BookingService(db, project_config, contact_send_id=contact_send_id)
             
@@ -665,7 +682,7 @@ async def process_message_async(project_id: str, client_id: str, queue_item_id: 
             # Step 1: Intent detection (async)
             logger.info(f"Message ID: {message_id} - Starting intent detection for client_id={client_id}")
             try:
-                intent_result = await claude_service.detect_intent(
+                intent_result = await ai_service.detect_intent(
                     project_config,
                     dialogue_history,
                     message_item.aggregated_message,
@@ -709,7 +726,7 @@ async def process_message_async(project_id: str, client_id: str, queue_item_id: 
                 tasks = []
                 
                 # Task 1: Service identification
-                service_task = claude_service.identify_service(
+                service_task = ai_service.identify_service(
                     project_config,
                     dialogue_history,
                     message_item.aggregated_message,
@@ -904,7 +921,7 @@ async def process_message_async(project_id: str, client_id: str, queue_item_id: 
                     newbie_status = 1
                 
                 # Existing call to generate_main_response
-                main_response = await claude_service.generate_main_response(
+                main_response = await ai_service.generate_main_response(
                     project_config,
                     dialogue_history,
                     message_item.aggregated_message,
