@@ -157,10 +157,12 @@ class MultiAIService:
             "Content-Type": "application/json",
         }
 
-        # ВАЖНО: Responses API => используем "input" и type="input_text"
+        # ЖЁСТКАЯ фиксация модели
+        MODEL = "o3"
+
         payload = {
-            "model": "gpt-o3",
-            "instructions": system_prompt,  # вместо отдельного system-сообщения
+            "model": MODEL,
+            "instructions": system_prompt,
             "input": [
                 {
                     "role": "user",
@@ -169,40 +171,34 @@ class MultiAIService:
                     ],
                 }
             ],
-            # В Responses API лимит токенов — это max_output_tokens
             "max_output_tokens": max_tokens,
             "temperature": temperature,
-            # опц. для reasoning-моделей:
-            # "reasoning": {"effort": "medium"},
-            # опц. если хочешь принудительно только текст:
-            # "modalities": ["text"],
         }
 
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(url, headers=headers, json=payload)
 
-        # Если 4xx/5xx — кинем понятную ошибку с телом ответа
+        # Разбираем ответ / ошибку
         try:
             data = resp.json()
         except Exception:
-            resp.raise_for_status()  # поднимет HTTPError, если не 2xx
-            # если 2xx, но тело не JSON — тоже ошибка
+            resp.raise_for_status()
             raise RuntimeError(f"Unexpected non-JSON response: {resp.text[:500]}")
 
         if resp.status_code >= 400:
-            # вытащим понятный фрагмент из ошибки OpenAI
             err = data.get("error", {})
-            raise RuntimeError(
-                f"OpenAI API error {resp.status_code}: "
-                f"{err.get('message')} (param={err.get('param')}, code={err.get('code')})"
-            )
+            # Возвращаем структурированную ошибку наверх — без повторного парсинга где-то дальше
+            return {"error": {
+                "status": resp.status_code,
+                "message": err.get("message"),
+                "param": err.get("param"),
+                "code": err.get("code"),
+            }}
 
-        # ---------- ПАРСИНГ ОТВЕТА Responses API ----------
-        # 1) Самый простой путь: готовая склеенная строка
-        if "output_text" in data and data["output_text"]:
+        # Текст из Responses API
+        if data.get("output_text"):
             text = data["output_text"]
         else:
-            # 2) Универсальный парсинг по фрагментам
             chunks = []
             for item in data.get("output", []):
                 for c in item.get("content", []):
@@ -210,10 +206,7 @@ class MultiAIService:
                         chunks.append(c.get("text", ""))
             text = "".join(chunks).strip()
 
-        return {
-            "text": text,
-            "raw": data,  # опционально для отладки
-        }
+        return {"text": text, "raw": data}
 
     async def _call_gemini(
         self, 
