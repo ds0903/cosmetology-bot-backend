@@ -215,10 +215,41 @@ class MultiAIService:
             temperature: float
     ) -> Dict[str, Any]:
         if not self.gemini_client:
-            raise ValueError("Gemini client not initialized. Check GEMINI_API_KEY")
+            return {
+                "response": '{"gpt_response":"Gemini client not initialized. Check GEMINI_API_KEY"}',
+                "provider": "gemini",
+                "model": getattr(self, "gemini_model", "unknown"),
+                "tokens_used": {"input": 0, "output": 0, "total": 0},
+                "cost_estimate": 0.0,
+            }
+
+        import asyncio
+        from typing import Any
+
+        def _extract_text(resp: Any) -> str:
+            # Витягуємо ТІЛЬКИ з candidates -> content.parts[].text (без resp.text)
+            text = ""
+            cands = getattr(resp, "candidates", None) or []
+            if cands:
+                cand = cands[0]
+                content = getattr(cand, "content", None)
+                if content and getattr(content, "parts", None):
+                    parts = content.parts
+                    text = "".join(getattr(p, "text", "") for p in parts if getattr(p, "text", None))
+                elif content and getattr(content, "text", None):
+                    text = content.text
+            return (text or "").strip()
+
+        def _finish_reason(resp: Any) -> str:
+            cands = getattr(resp, "candidates", None) or []
+            if cands:
+                fr = getattr(cands[0], "finish_reason", None)
+                # у різних SDK буває Enum або str/int — нормалізуємо до UPPER str
+                return str(fr).upper() if fr is not None else ""
+            return ""
 
         try:
-            # Жорстка інструкція на JSON у system_instruction
+            # Жорстка інструкція на JSON
             model = genai.GenerativeModel(
                 self.gemini_model,
                 system_instruction=(
@@ -230,44 +261,68 @@ class MultiAIService:
             gen_cfg = genai.GenerationConfig(
                 max_output_tokens=max_tokens,
                 temperature=temperature,
-                response_mime_type="application/json",  # змушує JSON
-                # response_schema=...  # за потреби можна додати схему
+                response_mime_type="application/json",
             )
 
-            import asyncio
+            # --- ПЕРШИЙ ВИКЛИК ---
             resp = await asyncio.to_thread(
                 model.generate_content,
                 [{"role": "user", "parts": [user_message]}],
                 generation_config=gen_cfg,
             )
+            text = _extract_text(resp)
+            fr = _finish_reason(resp)
 
-            # Витягуємо текст надійно
-            text = ""
-            if hasattr(resp, "text") and resp.text:
-                text = resp.text
-            elif getattr(resp, "candidates", None):
-                cand = resp.candidates[0]
-                if getattr(cand, "content", None):
-                    parts = getattr(cand.content, "parts", None)
-                    if parts:
-                        text = "".join(getattr(p, "text", "") for p in parts if getattr(p, "text", None))
-                    elif getattr(cand.content, "text", None):
-                        text = cand.content.text
+            # Якщо обрізано/заблоковано/порожньо — робимо одноразовий м’який ретрай
+            if (not text) or (fr and fr != "STOP"):
+                try:
+                    relaxed_safety = [
+                        genai.types.SafetySetting(
+                            category=genai.types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                            threshold=genai.types.BlockThreshold.BLOCK_NONE
+                        ),
+                        genai.types.SafetySetting(
+                            category=genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                            threshold=genai.types.BlockThreshold.BLOCK_NONE
+                        ),
+                        genai.types.SafetySetting(
+                            category=genai.types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                            threshold=genai.types.BlockThreshold.BLOCK_NONE
+                        ),
+                        genai.types.SafetySetting(
+                            category=genai.types.HarmCategory.HARM_CATEGORY_SEXUAL_CONTENT,
+                            threshold=genai.types.BlockThreshold.BLOCK_NONE
+                        ),
+                    ]
+                    resp = await asyncio.to_thread(
+                        model.generate_content,
+                        [{"role": "user", "parts": [user_message]}],
+                        generation_config=gen_cfg,
+                        safety_settings=relaxed_safety,
+                    )
+                    text = _extract_text(resp)
+                    fr = _finish_reason(resp)
+                except Exception as retry_err:
+                    logger.warning(f"Gemini soft-retry failed: {retry_err}")
 
+            # Якщо все ще немає валідної відповіді — контрольований fallback JSON
             if not text:
-                raise ValueError("Gemini returned empty response")
+                text = '{"gpt_response":"Вибачте, сталася помилка при отриманні відповіді від Gemini. Спробуйте ще раз."}'
 
-            # Токени/вартість — м'які дефолти якщо usage_metadata відсутня
+            # Токени/вартість — м’які дефолти, якщо usage_metadata немає
             tokens_in = getattr(getattr(resp, "usage_metadata", None), "prompt_token_count", 0) or 0
             tokens_out = getattr(getattr(resp, "usage_metadata", None), "candidates_token_count", 0) or 0
             if tokens_in == 0:
-                tokens_in = len(user_message.split())
+                tokens_in = max(1, len(user_message.split()))
             if tokens_out == 0:
-                tokens_out = len(text.split())
+                tokens_out = max(1, len(text.split()))
 
             cost = (tokens_in * 0.00000125) + (tokens_out * 0.00001)
 
-            logger.info(f"Gemini response length: {len(text)} chars")
+            logger.info(
+                f"Gemini response length: {len(text)} chars; "
+                f"finish_reason={fr or 'UNKNOWN'}; tokens_in={tokens_in}; tokens_out={tokens_out}"
+            )
 
             return {
                 "response": text,
@@ -283,7 +338,14 @@ class MultiAIService:
 
         except Exception as e:
             logger.error(f"Gemini API error: {e}")
-            raise
+            # Повертаємо валідний JSON-рядок, аби адаптер не падав на парсингу
+            return {
+                "response": '{"gpt_response":"Вибачте, сталася внутрішня помилка Gemini. Спробуйте ще раз."}',
+                "provider": "gemini",
+                "model": getattr(self, "gemini_model", "unknown"),
+                "tokens_used": {"input": 0, "output": 0, "total": 0},
+                "cost_estimate": 0.0,
+            }
 
     async def _call_grok(
         self, 
