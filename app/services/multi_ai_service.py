@@ -150,61 +150,102 @@ class MultiAIService:
 
         model = self.openai_model
 
-        # Жорстке підсилення вимоги JSON
+        # 1) Підсилення вимоги щодо JSON — як у Gemini/Grok
         enhanced_system = (
                 system_prompt
-                + "\n\nВАЖЛИВО: Відповідай ТІЛЬКИ валідним JSON (жодних markdown/пояснень)."
+                + "\n\nВАЖЛИВО: Відповідай ТІЛЬКИ валідним JSON (без markdown/пояснень/бектиків)."
         )
 
-        # Якщо це reasoning-модель o3 — використовуємо Responses API
-        if str(model).lower().startswith("o3"):
-            resp = await self.openai_client.responses.create(
-                model=model,
-                temperature=temperature,
-                max_output_tokens=max_tokens,
-                response_format={"type": "json_object"},
-                input=[
-                    {"role": "system", "content": enhanced_system},
-                    {"role": "user", "content": user_message}
-                ],
-            )
-            text = resp.output_text
-            # usage може відрізнятися; ставимо охайні дефолти
-            input_tokens = getattr(getattr(resp, "usage", None), "input_tokens", 0) or 0
-            output_tokens = getattr(getattr(resp, "usage", None), "output_tokens", 0) or 0
-        else:
-            # Для gpt-4o / 4o-mini залишаємо Chat Completions
-            resp = await self.openai_client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": enhanced_system},
-                    {"role": "user", "content": user_message},
-                ],
-                max_tokens=max_tokens,
-                temperature=temperature,
-                # Завжди просимо JSON
-                response_format={"type": "json_object"},
-            )
-            text = resp.choices[0].message.content
-            input_tokens = getattr(resp.usage, "prompt_tokens", 0) or 0
-            output_tokens = getattr(resp.usage, "completion_tokens", 0) or 0
+        # 2) Універсальний витягач тексту з Responses API (на випадок різних версій SDK)
+        def _extract_responses_text(resp_obj) -> str:
+            # нові SDK мають зручне поле
+            text = getattr(resp_obj, "output_text", None)
+            if isinstance(text, str) and text.strip():
+                return text.strip()
 
-        # Прикидка вартості (залиште ваші тарифи за потреби)
-        cost = (input_tokens * 0.0000025) + (output_tokens * 0.00001)
+            # fallback: зібрати вручну з resp.output
+            out = []
+            for item in getattr(resp_obj, "output", []) or []:
+                for c in getattr(item, "content", []) or []:
+                    # message.content[i].text або .type=="output_text"
+                    t = getattr(c, "text", None)
+                    if isinstance(t, str):
+                        out.append(t)
+                    else:
+                        # іноді це dict/obj із полем 'text'
+                        maybe = getattr(c, "value", None)
+                        if isinstance(maybe, str):
+                            out.append(maybe)
+            return "".join(out).strip()
 
-        logger.info(f"GPT(o3) response length: {len(text)} chars")
+        try:
+            # 3) Якщо це reasoning-модель o3 — Responses API з json_object
+            if str(model).lower().startswith("o3"):
+                resp = await self.openai_client.responses.create(
+                    model=model,
+                    # для o3 важливий responses API; 'messages' не використовуємо
+                    input=[
+                        {"role": "system", "content": enhanced_system},
+                        {"role": "user", "content": user_message},
+                    ],
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                    # (не обов'язково) легке керування reasoning, якщо треба:
+                    # reasoning={"effort":"medium"},
+                )
+                text = _extract_responses_text(resp)
+                usage = getattr(resp, "usage", None)
+                input_tokens = getattr(usage, "input_tokens", 0) or 0
+                output_tokens = getattr(usage, "output_tokens", 0) or 0
 
-        return {
-            "response": text,
-            "provider": "o3",
-            "model": model,
-            "tokens_used": {
-                "input": input_tokens,
-                "output": output_tokens,
-                "total": input_tokens + output_tokens
-            },
-            "cost_estimate": round(cost, 6)
-        }
+            else:
+                # 4) Для не-o3 (наприклад gpt-4o) — Chat Completions із json_object
+                resp = await self.openai_client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": enhanced_system},
+                        {"role": "user", "content": user_message},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    response_format={"type": "json_object"},
+                )
+                text = (resp.choices[0].message.content or "").strip()
+                input_tokens = getattr(resp.usage, "prompt_tokens", 0) or 0
+                output_tokens = getattr(resp.usage, "completion_tokens", 0) or 0
+
+            if not text:
+                # контрольований JSON, щоб адаптер не падав на парсингу
+                text = '{"gpt_response":"Вибачте, сталася помилка при отриманні відповіді від o3."}'
+
+            # 5) Невибаглива оцінка вартості (як і раніше)
+            cost = (input_tokens * 0.0000025) + (output_tokens * 0.00001)
+
+            logger.info(f"GPT(o3) response length: {len(text)} chars")
+
+            return {
+                "response": text,
+                "provider": "o3",
+                "model": model,
+                "tokens_used": {
+                    "input": input_tokens,
+                    "output": output_tokens,
+                    "total": input_tokens + output_tokens
+                },
+                "cost_estimate": round(cost, 6)
+            }
+
+        except Exception as e:
+            logger.error(f"OpenAI o3 API error: {e}", exc_info=True)
+            # повертаємо валідний JSON-рядок, щоб подальший пайплайн не падав
+            return {
+                "response": '{"gpt_response":"Вибачте, сталася внутрішня помилка o3. Спробуйте ще раз."}',
+                "provider": "o3",
+                "model": model,
+                "tokens_used": {"input": 0, "output": 0, "total": 0},
+                "cost_estimate": 0.0,
+            }
 
     # multi_ai_service.py
     async def _call_gemini(
