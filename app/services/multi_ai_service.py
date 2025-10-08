@@ -22,7 +22,7 @@ from ..config import settings
 
 logger = logging.getLogger(__name__)
 
-AIProvider = Literal["claude", "gpt-o3", "gemini", "grok"]
+AIProvider = Literal["claude", "o3", "gemini", "grok"]
 
 
 class MultiAIService:
@@ -86,7 +86,7 @@ class MultiAIService:
         try:
             if provider == "claude":
                 return await self._call_claude(system_prompt, user_message, max_tokens, temperature)
-            elif provider == "gpt-o3":
+            elif provider == "o3":
                 return await self._call_gpt_o3(system_prompt, user_message, max_tokens, temperature)
             elif provider == "gemini":
                 return await self._call_gemini(system_prompt, user_message, max_tokens, temperature)
@@ -146,8 +146,18 @@ class MultiAIService:
     import httpx
     from typing import Dict, Any
 
-    async def _call_gpt_o3(self, system_prompt: str, user_message: str, max_tokens: int, temperature: float) -> Dict[
-        str, Any]:
+    async def _call_gpt_o3(
+            self,
+            system_prompt: str,
+            user_message: str,
+            max_tokens: int,
+            temperature: float
+    ) -> Dict[str, Any]:
+        """
+        Вызов OpenAI Responses API для reasoning-модели o3.
+        Использует instructions + input (type='input_text') и парсит output_text.
+        На 4xx/5xx возвращает структурированную ошибку в виде {"error": {...}} без исключений.
+        """
         if not self.openai_client:
             raise ValueError("OpenAI client not initialized. Check OPENAI_API_KEY")
 
@@ -157,12 +167,12 @@ class MultiAIService:
             "Content-Type": "application/json",
         }
 
-        # ЖЁСТКАЯ фиксация модели
+        # ЖЁСТКО фиксируем корректное имя модели для API
         MODEL = "o3"
 
-        payload = {
+        payload: Dict[str, Any] = {
             "model": MODEL,
-            "instructions": system_prompt,
+            "instructions": system_prompt,  # вместо system-сообщения
             "input": [
                 {
                     "role": "user",
@@ -171,42 +181,50 @@ class MultiAIService:
                     ],
                 }
             ],
-            "max_output_tokens": max_tokens,
+            "max_output_tokens": max_tokens,  # в Responses API это именно max_output_tokens
             "temperature": temperature,
+            # При необходимости можно добавить:
+            # "modalities": ["text"],
+            # "reasoning": {"effort": "medium"},
         }
 
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(url, headers=headers, json=payload)
 
-        # Разбираем ответ / ошибку
+        # --- разбор ответа / ошибок ---
         try:
             data = resp.json()
         except Exception:
+            # Если тело не JSON — поднимем для 4xx/5xx, иначе обработаем как неожиданное 2xx
             resp.raise_for_status()
             raise RuntimeError(f"Unexpected non-JSON response: {resp.text[:500]}")
 
         if resp.status_code >= 400:
-            err = data.get("error", {})
-            # Возвращаем структурированную ошибку наверх — без повторного парсинга где-то дальше
-            return {"error": {
-                "status": resp.status_code,
-                "message": err.get("message"),
-                "param": err.get("param"),
-                "code": err.get("code"),
-            }}
+            # Возвращаем структурированную ошибку наверх (не бросаем KeyError в вызывающем коде)
+            err = data.get("error", {}) if isinstance(data, dict) else {}
+            return {
+                "error": {
+                    "status": resp.status_code,
+                    "message": err.get("message"),
+                    "param": err.get("param"),
+                    "code": err.get("code"),
+                }
+            }
 
-        # Текст из Responses API
-        if data.get("output_text"):
-            text = data["output_text"]
-        else:
+        # --- успешный ответ ---
+        # 1) Прямо из "output_text", если есть
+        text = data.get("output_text") if isinstance(data, dict) else None
+
+        # 2) Иначе собираем из output[].content[].type == "output_text"
+        if not text:
             chunks = []
-            for item in data.get("output", []):
+            for item in data.get("output", []) if isinstance(data, dict) else []:
                 for c in item.get("content", []):
                     if c.get("type") == "output_text":
                         chunks.append(c.get("text", ""))
             text = "".join(chunks).strip()
 
-        return {"text": text, "raw": data}
+        return {"text": text or "", "raw": data}
 
     async def _call_gemini(
         self, 
@@ -314,7 +332,7 @@ class MultiAIService:
         if self.claude_client:
             providers.append("claude")
         if self.openai_client:
-            providers.append("gpt-o3")
+            providers.append("o3")
         if self.gemini_client:
             providers.append("gemini")
         if self.grok_client:

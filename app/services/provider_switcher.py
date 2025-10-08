@@ -22,14 +22,14 @@ def set_current_provider(provider: str) -> dict:
     Змінити поточну модель
     
     Args:
-        provider: "claude", "gpt-o3", "gemini", "grok"
+        provider: "claude", "o3", "gemini", "grok"
     
     Returns:
         dict з результатом
     """
     global _current_provider, _provider_history
     
-    valid_providers = ["claude", "gpt-o3", "gemini", "grok"]
+    valid_providers = ["claude", "o3", "gemini", "grok"]
     
     if provider not in valid_providers:
         return {
