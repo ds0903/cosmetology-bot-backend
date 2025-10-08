@@ -142,58 +142,60 @@ class MultiAIService:
             },
             "cost_estimate": round(cost, 6)
         }
-    
-    async def _call_gpt_o3(
-        self, 
-        system_prompt: str, 
-        user_message: str, 
-        max_tokens: int, 
-        temperature: float
-    ) -> Dict[str, Any]:
-        """Виклик GPT o3 (OpenAI Responses API)"""
+
+    async def _call_gpt_o3(self, system_prompt: str, user_message: str, max_tokens: int, temperature: float):
         if not self.openai_client:
             raise ValueError("OpenAI client not initialized. Check OPENAI_API_KEY")
-        
-        # GPT o3 використовує новий Responses API
-        # Документація: https://platform.openai.com/docs/api-reference/responses
-        
-        async with httpx.AsyncClient() as client:
-            headers = {
-                "Authorization": f"Bearer {settings.openai_api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "model": self.openai_model,  # Використовуємо модель з .env
-                "input": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ]
-            }
-            
-            response = await client.post(
-                "https://api.openai.com/v1/responses",
-                headers=headers,
-                json=payload,
-                timeout=60.0
-            )
-            response.raise_for_status()
-            data = response.json()
-        
-        # Парсинг відповіді
-        text = data["output"][0]["content"][0]["text"]
-        
-        # Розрахунок вартості для o3
-        # Ціни: $2/M input, $8/M output
-        # Примітка: токени не завжди доступні у відповіді o3
-        tokens_in = len(system_prompt.split()) + len(user_message.split())  # наближена оцінка
-        tokens_out = len(text.split())  # наближена оцінка
+
+        url = "https://api.openai.com/v1/responses"
+        headers = {
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": self.openai_model,  # "o3" або "o3-mini"
+            "input": [
+                {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+                {"role": "user", "content": [{"type": "input_text", "text": user_message}]},
+            ],
+            # опційно: "reasoning": {"effort": "medium"}
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            try:
+                r.raise_for_status()
+            except httpx.HTTPStatusError:
+                # не парсимо як JSON «наосліп» — спочатку лог текст
+                raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text}") from None
+
+            data = r.json()
+
+        # Безпечний парсинг
+        text = data.get("output_text")
+        if not text:
+            # шукаємо перший блок assistant з output_text
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            text = c.get("text")
+                            break
+                if text:
+                    break
+        if not text:
+            raise RuntimeError(f"Unexpected o3 response format: {data}")
+
+        # (решта — як у тебе, оцінка токенів/вартості)
+        tokens_in = len(system_prompt.split()) + len(user_message.split())
+        tokens_out = len(text.split())
         cost = (tokens_in * 0.000002) + (tokens_out * 0.000008)
-        
+
         return {
             "response": text,
             "provider": "gpt-o3",
-            "model": self.openai_model,  # Повертаємо реальну назву моделі
+            "model": self.openai_model,
             "tokens_used": {
                 "input": tokens_in,
                 "output": tokens_out,
@@ -202,7 +204,7 @@ class MultiAIService:
             },
             "cost_estimate": round(cost, 6)
         }
-    
+
     async def _call_gemini(
         self, 
         system_prompt: str, 
