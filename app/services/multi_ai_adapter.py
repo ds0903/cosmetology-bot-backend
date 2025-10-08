@@ -5,6 +5,7 @@
 
 import json
 import logging
+import re
 from typing import Dict, Any, Optional, Literal
 from datetime import datetime
 
@@ -23,14 +24,6 @@ logger = logging.getLogger(__name__)
 class MultiAIAdapter:
     """
     Адаптер який замінює ClaudeService і дозволяє використовувати різні AI моделі
-    
-    Приклад використання:
-        # Замість ClaudeService
-        ai_service = MultiAIAdapter(db, provider="claude")
-        
-        # Або динамічно
-        ai_service = MultiAIAdapter(db)
-        ai_service.set_provider("o3")
     """
     
     def __init__(self, db, provider: AIProvider = None):
@@ -51,7 +44,7 @@ class MultiAIAdapter:
         elif hasattr(settings, 'default_ai_provider'):
             self.current_provider = settings.default_ai_provider
         else:
-            self.current_provider = "claude"  # Default fallback
+            self.current_provider = "claude"
         
         logger.info(f"MultiAIAdapter initialized with provider: {self.current_provider}")
         
@@ -83,6 +76,29 @@ class MultiAIAdapter:
             "total_cost_estimate": round(self.total_cost, 6)
         }
     
+    def _enhance_prompt_for_provider(self, base_prompt: str, provider: str) -> str:
+        """Адаптує промпт під конкретну модель"""
+        
+        # Додаємо спеціалізовані інструкції для non-Claude моделей
+        if provider != "claude":
+            enhancement = """
+КРИТИЧНО ВАЖЛИВО ДЛЯ JSON ВІДПОВІДІ:
+1. Відповідай ТІЛЬКИ чистим JSON без будь-яких додаткових текстів, markdown або пояснень
+2. НЕ використовуй ```json``` обгортки - тільки чистий JSON
+3. Переконайся що всі ключі точно відповідають тим, що вказані в інструкціях
+4. Всі булеві значення передавай як true/false (малими літерами)
+5. Всі строкові значення беруть в подвійні лапки
+6. НЕ додавай ніяких коментарів після JSON
+7. Перевір що JSON валідний перед відповіддю
+
+ФОРМАТ ВІДПОВІДІ МАЄ БУТИ ТОЧНО ТАКИМ:
+{"key1": "value1", "key2": true, "key3": null}
+
+"""
+            base_prompt = enhancement + base_prompt
+        
+        return base_prompt
+    
     async def _call_ai(
         self, 
         system_prompt: str, 
@@ -91,13 +107,15 @@ class MultiAIAdapter:
         provider: Optional[AIProvider] = None
     ) -> Dict[str, Any]:
         """Внутрішній метод виклику AI"""
-        # Використовуємо вказаний провайдер або поточний
         provider_to_use = provider or self.current_provider
+        
+        # Адаптуємо промпт під провайдера
+        enhanced_system_prompt = self._enhance_prompt_for_provider(system_prompt, provider_to_use)
         
         # Виклик AI
         result = await self.multi_ai.send_message(
             provider=provider_to_use,
-            system_prompt=system_prompt,
+            system_prompt=enhanced_system_prompt,
             user_message=user_prompt,
             max_tokens=max_tokens
         )
@@ -141,26 +159,24 @@ class MultiAIAdapter:
         user_prompt = "\n".join(user_prompt_parts)
         
         try:
-            # Виклик AI
             result = await self._call_ai(system_prompt, user_prompt, max_tokens=1000)
             
-            # Парсинг відповіді
-            raw_response = result["response"]
-            logger.info(f"Message ID: {message_id} - Raw response: {raw_response[:200]}")
+            raw_response = result.get("response", result.get("text", ""))
+            logger.info(f"Message ID: {message_id} - Raw intent response ({self.current_provider}): {raw_response[:200]}")
             
-            # Парсимо JSON відповідь
             parsed = self._parse_json_response(raw_response, message_id)
             
             if parsed:
-                intent_result = IntentDetectionResult(**parsed)
-                logger.info(f"Message ID: {message_id} - Intent: waiting={intent_result.waiting}")
+                normalized = self._normalize_intent_fields(parsed, message_id)
+                intent_result = IntentDetectionResult(**normalized)
+                logger.info(f"Message ID: {message_id} - Intent ({self.current_provider}): waiting={intent_result.waiting}, date={intent_result.date_order}")
                 return intent_result
             else:
-                logger.warning(f"Message ID: {message_id} - Failed to parse, using default")
+                logger.warning(f"Message ID: {message_id} - Failed to parse intent from {self.current_provider}, using default")
                 return IntentDetectionResult(waiting=1)
                 
         except Exception as e:
-            logger.error(f"Message ID: {message_id} - Error in intent detection: {e}")
+            logger.error(f"Message ID: {message_id} - Error in intent detection ({self.current_provider}): {e}")
             return IntentDetectionResult(waiting=1)
     
     async def identify_service(
@@ -176,7 +192,6 @@ class MultiAIAdapter:
         """
         logger.info(f"Message ID: {message_id} - Service identification using {self.current_provider}")
         
-        # Отримуємо промпт
         base_prompt = get_prompt("service_identification")
         services_json = json.dumps(project_config.services, ensure_ascii=False, indent=2)
         system_prompt = f"{base_prompt}\n\nДоступні послуги:\n{services_json}"
@@ -185,19 +200,22 @@ class MultiAIAdapter:
         
         try:
             result = await self._call_ai(system_prompt, user_prompt, max_tokens=500)
-            raw_response = result["response"]
+            raw_response = result.get("response", result.get("text", ""))
+            
+            logger.info(f"Message ID: {message_id} - Raw service response ({self.current_provider}): {raw_response[:200]}")
             
             parsed = self._parse_json_response(raw_response, message_id)
             
             if parsed:
-                service_result = ServiceIdentificationResult(**parsed)
-                logger.info(f"Message ID: {message_id} - Service: {service_result.service_name}, duration: {service_result.time_fraction}")
+                normalized = self._normalize_service_fields(parsed, message_id)
+                service_result = ServiceIdentificationResult(**normalized)
+                logger.info(f"Message ID: {message_id} - Service ({self.current_provider}): {service_result.service_name}, duration: {service_result.time_fraction}")
                 return service_result
             else:
                 return ServiceIdentificationResult(time_fraction=1, service_name="unknown")
                 
         except Exception as e:
-            logger.error(f"Message ID: {message_id} - Error in service identification: {e}")
+            logger.error(f"Message ID: {message_id} - Error in service identification ({self.current_provider}): {e}")
             return ServiceIdentificationResult(time_fraction=1, service_name="unknown")
     
     async def generate_main_response(
@@ -222,12 +240,10 @@ class MultiAIAdapter:
         """
         logger.info(f"Message ID: {message_id} - Main response using {self.current_provider}")
         
-        # Отримуємо промпт
         base_prompt = get_prompt("main_response")
         specialists = ', '.join(project_config.specialists)
         system_prompt = f"{base_prompt}\n\nСпеціалісти: {specialists}"
         
-        # Формуємо user prompt
         user_prompt_parts = [
             f"current_date: {current_date}",
             f"day_of_week: {day_of_week}",
@@ -250,57 +266,89 @@ class MultiAIAdapter:
         
         try:
             result = await self._call_ai(system_prompt, user_prompt, max_tokens=2000)
-            raw_response = result["response"]
+            raw_response = result.get("response", result.get("text", ""))
+            
+            logger.info(f"Message ID: {message_id} - Raw main response ({self.current_provider}): {raw_response[:200]}")
             
             parsed = self._parse_json_response(raw_response, message_id)
             
             if parsed:
-                # CRITICAL FIX: Обробляємо різні назви полів від різних моделей
-                # Деякі моделі повертають client_response замість gpt_response (з прикладів у промпті)
-                if 'gpt_response' not in parsed and 'client_response' in parsed:
-                    logger.info(f"Message ID: {message_id} - Converting client_response to gpt_response")
-                    parsed['gpt_response'] = parsed['client_response']
-                
-                # Якщо немає ні gpt_response, ні client_response - fallback
-                if 'gpt_response' not in parsed:
-                    logger.error(f"Message ID: {message_id} - No gpt_response or client_response in parsed result: {list(parsed.keys())}")
-                    parsed['gpt_response'] = "Вибачте, сталася помилка. Спробуйте ще раз."
+                normalized = self._normalize_main_response_fields(parsed, message_id)
                 
                 try:
-                    main_response = ClaudeMainResponse(**parsed)
-                    logger.info(f"Message ID: {message_id} - Response generated, cost: ${result.get('cost_estimate', 0):.6f}")
+                    main_response = ClaudeMainResponse(**normalized)
+                    logger.info(f"Message ID: {message_id} - Response generated by {self.current_provider}, cost: ${result.get('cost_estimate', 0):.6f}")
+                    logger.info(f"Message ID: {message_id} - Response text length: {len(normalized.get('gpt_response', ''))} chars")
+                    logger.info(f"Message ID: {message_id} - Booking actions: activate={normalized.get('activate_booking')}, reject={normalized.get('reject_order')}, change={normalized.get('change_order')}")
                     return main_response
                 except Exception as validation_error:
-                    logger.error(f"Message ID: {message_id} - Validation error: {validation_error}")
-                    logger.error(f"Message ID: {message_id} - Parsed data: {parsed}")
+                    logger.error(f"Message ID: {message_id} - Validation error ({self.current_provider}): {validation_error}")
+                    logger.error(f"Message ID: {message_id} - Normalized data: {normalized}")
                     return ClaudeMainResponse(gpt_response="Вибачте, сталася помилка. Спробуйте ще раз.")
             else:
+                logger.warning(f"Message ID: {message_id} - Failed to parse main response from {self.current_provider}")
                 return ClaudeMainResponse(gpt_response="Вибачте, сталася помилка. Спробуйте ще раз.")
                 
         except Exception as e:
-            logger.error(f"Message ID: {message_id} - Error in main response: {e}")
+            logger.error(f"Message ID: {message_id} - Error in main response ({self.current_provider}): {e}", exc_info=True)
             return ClaudeMainResponse(gpt_response="Вибачте, сталася помилка. Спробуйте ще раз.")
     
     def _parse_json_response(self, raw_response: str, message_id: str) -> Optional[dict]:
-        """Парсинг JSON відповіді від будь-якої AI моделі"""
+        """Парсинг JSON відповіді від будь-якої AI моделі з покращеною обробкою"""
         try:
-            # Очищаємо відповідь
             content = raw_response.strip()
             
+            # Видаляємо різні префікси
+            prefixes = ["json", "JSON", "```json", "```JSON"]
+            for prefix in prefixes:
+                if content.startswith(prefix):
+                    content = content[len(prefix):].strip()
+            
             # Видаляємо markdown блоки
-            if content.startswith("```json"):
-                content = content[7:]
             if content.startswith("```"):
                 content = content[3:]
             if content.endswith("```"):
                 content = content[:-3]
             content = content.strip()
             
-            # Шукаємо JSON в тексті
-            import re
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            if json_match:
-                content = json_match.group(0)
+            # Шукаємо JSON в тексті методом пошуку відкриваючої і закриваючої дужок
+            if not content.startswith("{"):
+                start = content.find("{")
+                if start != -1:
+                    # Шукаємо відповідну закриваючу дужку
+                    brace_count = 0
+                    end = -1
+                    in_string = False
+                    escape_next = False
+                    
+                    for i in range(start, len(content)):
+                        char = content[i]
+                        
+                        if escape_next:
+                            escape_next = False
+                            continue
+                        
+                        if char == '\\':
+                            escape_next = True
+                            continue
+                        
+                        if char == '"' and not escape_next:
+                            in_string = not in_string
+                        
+                        if not in_string:
+                            if char == '{':
+                                brace_count += 1
+                            elif char == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    end = i + 1
+                                    break
+                    
+                    if end > start:
+                        content = content[start:end]
+            
+            # Видаляємо control characters
+            content = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', content)
             
             # Парсимо JSON
             result = json.loads(content)
@@ -308,12 +356,222 @@ class MultiAIAdapter:
             if not isinstance(result, dict):
                 raise ValueError(f"Response is not a dictionary: {type(result)}")
             
+            # Логуємо thinking якщо є
+            if 'thinking' in result:
+                logger.debug(f"Message ID: {message_id} - AI thinking ({self.current_provider}): {result['thinking'][:200]}")
+            
             return result
             
         except json.JSONDecodeError as e:
-            logger.error(f"Message ID: {message_id} - JSON parsing error: {e}")
+            logger.error(f"Message ID: {message_id} - JSON parsing error ({self.current_provider}): {e}")
             logger.error(f"Raw response: {raw_response[:500]}")
             return None
         except Exception as e:
-            logger.error(f"Message ID: {message_id} - Parsing error: {e}")
+            logger.error(f"Message ID: {message_id} - Parsing error ({self.current_provider}): {e}")
             return None
+    
+    def _normalize_intent_fields(self, parsed: dict, message_id: str) -> dict:
+        """Нормалізація полів для IntentDetectionResult з підтримкою різних форматів"""
+        
+        # Обробка waiting
+        waiting = parsed.get('waiting', 0)
+        if isinstance(waiting, str):
+            waiting = 1 if waiting.lower() in ('1', 'true', 'yes', 'так') else 0
+        elif isinstance(waiting, bool):
+            waiting = 1 if waiting else 0
+        else:
+            waiting = int(waiting) if isinstance(waiting, (int, float)) else 0
+        
+        # Обробка date_order - різні варіанти назв
+        date_order = (parsed.get('date_order') or parsed.get('date') or 
+                     parsed.get('desired_date') or parsed.get('appointment_date'))
+        
+        # Обробка desire_time з різними варіантами назв
+        desire_time0 = (parsed.get('desire_time_0') or parsed.get('desire_time0') or 
+                       parsed.get('time_start') or parsed.get('desired_time_start') or
+                       parsed.get('time_from'))
+        desire_time1 = (parsed.get('desire_time_1') or parsed.get('desire_time1') or 
+                       parsed.get('time_end') or parsed.get('desired_time_end') or
+                       parsed.get('time_to'))
+        
+        # Якщо є тільки одне поле desire_time
+        if not desire_time0 and parsed.get('desire_time'):
+            desire_time0 = parsed.get('desire_time')
+        
+        # Обробка інших полів
+        name = parsed.get('name') or parsed.get('client_name') or parsed.get('customer_name')
+        procedure = (parsed.get('procedure') or parsed.get('service') or 
+                    parsed.get('service_name') or parsed.get('treatment'))
+        cosmetolog = (parsed.get('cosmetolog') or parsed.get('specialist') or 
+                     parsed.get('master') or parsed.get('doctor'))
+        desire_date = parsed.get('desire_date') or parsed.get('preferred_date')
+        
+        normalized = {
+            'waiting': waiting,
+            'date_order': date_order,
+            'desire_time0': desire_time0,
+            'desire_time1': desire_time1,
+            'name': name,
+            'procedure': procedure,
+            'cosmetolog': cosmetolog,
+            'desire_date': desire_date
+        }
+        
+        logger.debug(f"Message ID: {message_id} - Normalized intent: waiting={waiting}, date={date_order}, time={desire_time0}-{desire_time1}")
+        return normalized
+    
+    def _normalize_service_fields(self, parsed: dict, message_id: str) -> dict:
+        """Нормалізація полів для ServiceIdentificationResult"""
+        
+        # Обробка time_fraction - різні варіанти назв
+        time_fraction = (parsed.get('time_fractions') or parsed.get('time_fraction') or 
+                        parsed.get('duration') or parsed.get('slots') or 
+                        parsed.get('duration_slots') or 1)
+        
+        # Якщо це словник (старий формат) - беремо перше значення
+        if isinstance(time_fraction, dict):
+            time_fraction = list(time_fraction.values())[0] if time_fraction else 1
+        
+        # Конвертуємо в число
+        if isinstance(time_fraction, str):
+            time_fraction = int(time_fraction) if time_fraction.isdigit() else 1
+        elif not isinstance(time_fraction, int):
+            time_fraction = int(time_fraction) if time_fraction else 1
+        
+        # Обробка service_name - різні варіанти назв
+        service_name = (parsed.get('service_name') or parsed.get('service') or 
+                       parsed.get('procedure') or parsed.get('treatment') or "unknown")
+        
+        normalized = {
+            'time_fraction': time_fraction,
+            'service_name': service_name
+        }
+        
+        logger.debug(f"Message ID: {message_id} - Normalized service: {service_name}, duration: {time_fraction} slots")
+        return normalized
+    
+    def _normalize_main_response_fields(self, parsed: dict, message_id: str) -> dict:
+        """Нормалізація полів для ClaudeMainResponse з підтримкою всіх можливих варіантів"""
+        
+        # КРИТИЧНО: Обробка gpt_response з максимальною кількістю варіантів
+        gpt_response = (parsed.get('gpt_response') or parsed.get('client_response') or 
+                       parsed.get('response') or parsed.get('message') or 
+                       parsed.get('answer') or parsed.get('reply') or
+                       parsed.get('text') or parsed.get('bot_response') or
+                       parsed.get('assistant_response'))
+        
+        # Якщо нічого не знайдено, створюємо дефолтну відповідь
+        if not gpt_response:
+            logger.warning(f"Message ID: {message_id} - No response text found in any standard fields. Keys: {list(parsed.keys())}")
+            # Шукаємо будь-яке текстове поле
+            for key, value in parsed.items():
+                if isinstance(value, str) and len(value) > 20 and key != 'thinking':
+                    gpt_response = value
+                    logger.info(f"Message ID: {message_id} - Using field '{key}' as response text")
+                    break
+            
+            if not gpt_response:
+                gpt_response = "Вибачте, сталася помилка. Спробуйте ще раз."
+        
+        # Функція конвертації в boolean
+        def to_bool(value):
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.lower() in ('true', '1', 'yes', 'так', 'да')
+            if isinstance(value, int):
+                return value == 1
+            return bool(value)
+        
+        # Обробка команд бронювання - максимальна кількість варіантів назв
+        activate_booking = to_bool(parsed.get('activate_booking') or parsed.get('create_booking') or 
+                                   parsed.get('make_booking') or parsed.get('book') or
+                                   parsed.get('confirm_booking'))
+        
+        reject_order = to_bool(parsed.get('reject_order') or parsed.get('cancel_booking') or 
+                              parsed.get('cancel_order') or parsed.get('delete_booking'))
+        
+        change_order = to_bool(parsed.get('change_order') or parsed.get('modify_booking') or 
+                              parsed.get('update_booking') or parsed.get('reschedule'))
+        
+        booking_confirmed = to_bool(parsed.get('booking_confirmed') or parsed.get('confirmed'))
+        booking_declined = to_bool(parsed.get('booking_declined') or parsed.get('declined'))
+        
+        # Обробка double_booking
+        double_booking = to_bool(parsed.get('double_booking') or parsed.get('multiple_booking') or
+                                parsed.get('two_bookings'))
+        
+        # Обробка списків для double booking
+        specialists_list = (parsed.get('specialists_list') or parsed.get('specialists') or
+                           parsed.get('masters_list') or parsed.get('doctors_list'))
+        times_set_up_list = (parsed.get('times_set_up_list') or parsed.get('times') or
+                            parsed.get('booking_times') or parsed.get('appointment_times'))
+        times_reject_list = (parsed.get('times_reject_list') or parsed.get('cancel_times') or
+                            parsed.get('delete_times'))
+        procedures_list = (parsed.get('procedures_list') or parsed.get('procedures') or 
+                          parsed.get('services') or parsed.get('services_list'))
+        
+        # Обробка основних полів з альтернативними назвами
+        date_order = (parsed.get('date_order') or parsed.get('booking_date') or 
+                     parsed.get('date') or parsed.get('appointment_date'))
+        
+        time_set_up = (parsed.get('time_set_up') or parsed.get('booking_time') or 
+                      parsed.get('time') or parsed.get('appointment_time'))
+        
+        date_reject = (parsed.get('date_reject') or parsed.get('cancel_date') or
+                      parsed.get('cancellation_date'))
+        
+        time_reject = (parsed.get('time_reject') or parsed.get('cancel_time') or
+                      parsed.get('cancellation_time'))
+        
+        cosmetolog = (parsed.get('cosmetolog') or parsed.get('specialist') or 
+                     parsed.get('master') or parsed.get('doctor') or
+                     parsed.get('specialist_name'))
+        
+        procedure = (parsed.get('procedure') or parsed.get('service') or 
+                    parsed.get('service_name') or parsed.get('treatment'))
+        
+        phone = parsed.get('phone') or parsed.get('telephone') or parsed.get('phone_number')
+        name = parsed.get('name') or parsed.get('client_name') or parsed.get('customer_name')
+        
+        normalized = {
+            'gpt_response': gpt_response,
+            'pic': parsed.get('pic'),
+            'activate_booking': activate_booking,
+            'reject_order': reject_order,
+            'change_order': change_order,
+            'booking_confirmed': booking_confirmed,
+            'booking_declined': booking_declined,
+            'cosmetolog': cosmetolog,
+            'time_set_up': time_set_up,
+            'date_order': date_order,
+            'time_reject': time_reject,
+            'date_reject': date_reject,
+            'procedure': procedure,
+            'phone': phone,
+            'name': name,
+            'feedback': parsed.get('feedback'),
+            'double_booking': double_booking,
+            'specialists_list': specialists_list,
+            'times_set_up_list': times_set_up_list,
+            'times_reject_list': times_reject_list,
+            'procedures_list': procedures_list
+        }
+        
+        # Детальне логування
+        logger.info(f"Message ID: {message_id} - Normalized main response from {self.current_provider}:")
+        logger.info(f"  - Response text: {len(gpt_response)} chars")
+        logger.info(f"  - activate_booking: {activate_booking}")
+        logger.info(f"  - reject_order: {reject_order}")
+        logger.info(f"  - change_order: {change_order}")
+        logger.info(f"  - double_booking: {double_booking}")
+        
+        if activate_booking:
+            logger.info(f"  - Booking details: {cosmetolog} at {date_order} {time_set_up} for {procedure}")
+        
+        if double_booking:
+            logger.info(f"  - Double booking: specialists={specialists_list}, times={times_set_up_list}")
+        
+        return normalized
