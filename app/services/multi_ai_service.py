@@ -137,6 +137,7 @@ class MultiAIService:
             "cost_estimate": round(cost, 6)
         }
 
+    # multi_ai_service.py
     async def _call_gpt_o3(
             self,
             system_prompt: str,
@@ -144,119 +145,130 @@ class MultiAIService:
             max_tokens: int,
             temperature: float
     ) -> Dict[str, Any]:
-        """
-        OpenAI GPT через Chat Completions API
-        Адаптовано для роботи 1-в-1 як Claude
-        """
         if not self.openai_client:
             raise ValueError("OpenAI client not initialized. Check OPENAI_API_KEY")
-        
-        try:
-            # Додаємо спеціальну інструкцію для GPT щоб він відповідав JSON
-            enhanced_system = system_prompt + "\n\nВАЖЛИВО: Відповідай ТІЛЬКИ чистим JSON без markdown обгорток і додаткового тексту."
-            
-            response = await self.openai_client.chat.completions.create(
-                model=self.openai_model,
-                messages=[
+
+        model = self.openai_model
+
+        # Жорстке підсилення вимоги JSON
+        enhanced_system = (
+                system_prompt
+                + "\n\nВАЖЛИВО: Відповідай ТІЛЬКИ валідним JSON (жодних markdown/пояснень)."
+        )
+
+        # Якщо це reasoning-модель o3 — використовуємо Responses API
+        if str(model).lower().startswith("o3"):
+            resp = await self.openai_client.responses.create(
+                model=model,
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+                response_format={"type": "json_object"},
+                input=[
                     {"role": "system", "content": enhanced_system},
                     {"role": "user", "content": user_message}
                 ],
+            )
+            text = resp.output_text
+            # usage може відрізнятися; ставимо охайні дефолти
+            input_tokens = getattr(getattr(resp, "usage", None), "input_tokens", 0) or 0
+            output_tokens = getattr(getattr(resp, "usage", None), "output_tokens", 0) or 0
+        else:
+            # Для gpt-4o / 4o-mini залишаємо Chat Completions
+            resp = await self.openai_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": enhanced_system},
+                    {"role": "user", "content": user_message},
+                ],
                 max_tokens=max_tokens,
                 temperature=temperature,
-                response_format={"type": "json_object"} if "json" in system_prompt.lower() else None
+                # Завжди просимо JSON
+                response_format={"type": "json_object"},
             )
-            
-            text = response.choices[0].message.content
-            input_tokens = response.usage.prompt_tokens
-            output_tokens = response.usage.completion_tokens
-            
-            # Ціни для GPT-4o: $2.5/M input, $10/M output
-            cost = (input_tokens * 0.0000025) + (output_tokens * 0.00001)
-            
-            logger.info(f"GPT response length: {len(text)} chars")
-            
-            return {
-                "response": text,
-                "provider": "o3",
-                "model": self.openai_model,
-                "tokens_used": {
-                    "input": input_tokens,
-                    "output": output_tokens,
-                    "total": input_tokens + output_tokens
-                },
-                "cost_estimate": round(cost, 6)
-            }
-            
-        except Exception as e:
-            logger.error(f"GPT API error: {e}")
-            raise
+            text = resp.choices[0].message.content
+            input_tokens = getattr(resp.usage, "prompt_tokens", 0) or 0
+            output_tokens = getattr(resp.usage, "completion_tokens", 0) or 0
 
+        # Прикидка вартості (залиште ваші тарифи за потреби)
+        cost = (input_tokens * 0.0000025) + (output_tokens * 0.00001)
+
+        logger.info(f"GPT(o3) response length: {len(text)} chars")
+
+        return {
+            "response": text,
+            "provider": "o3",
+            "model": model,
+            "tokens_used": {
+                "input": input_tokens,
+                "output": output_tokens,
+                "total": input_tokens + output_tokens
+            },
+            "cost_estimate": round(cost, 6)
+        }
+
+    # multi_ai_service.py
     async def _call_gemini(
-        self, 
-        system_prompt: str, 
-        user_message: str, 
-        max_tokens: int, 
-        temperature: float
+            self,
+            system_prompt: str,
+            user_message: str,
+            max_tokens: int,
+            temperature: float
     ) -> Dict[str, Any]:
-        """
-        Виклик Gemini (Google) з покращеною обробкою
-        Адаптовано для роботи 1-в-1 як Claude
-        """
         if not self.gemini_client:
             raise ValueError("Gemini client not initialized. Check GEMINI_API_KEY")
-        
+
         try:
-            # Додаємо спеціальну інструкцію для Gemini
-            enhanced_system = system_prompt + "\n\nКРИТИЧНО ВАЖЛИВО: Твоя відповідь має бути ТІЛЬКИ чистим JSON. Ніяких додаткових текстів, пояснень або markdown обгорток. Тільки валідний JSON який починається з { і закінчується }."
-            
-            full_prompt = f"{enhanced_system}\n\nUser: {user_message}\n\nTWOЯ ВІДПОВІДЬ (тільки JSON):"
-            
-            import asyncio
-            response = await asyncio.to_thread(
-                self.gemini_client.generate_content,
-                full_prompt,
-                generation_config=genai.GenerationConfig(
-                    max_output_tokens=max_tokens,
-                    temperature=temperature,
-                    response_mime_type="application/json"  # КРИТИЧНО: примушуємо JSON формат
-                )
+            # Жорстка інструкція на JSON у system_instruction
+            model = genai.GenerativeModel(
+                self.gemini_model,
+                system_instruction=(
+                        system_prompt
+                        + "\n\nКРИТИЧНО: Відповідай ТІЛЬКИ валідним JSON (без пояснень/markdown)."
+                ),
             )
-            
-            # Отримуємо текст з різних можливих полів
+
+            gen_cfg = genai.GenerationConfig(
+                max_output_tokens=max_tokens,
+                temperature=temperature,
+                response_mime_type="application/json",  # змушує JSON
+                # response_schema=...  # за потреби можна додати схему
+            )
+
+            import asyncio
+            resp = await asyncio.to_thread(
+                model.generate_content,
+                [{"role": "user", "parts": [user_message]}],
+                generation_config=gen_cfg,
+            )
+
+            # Витягуємо текст надійно
             text = ""
-            if hasattr(response, 'text'):
-                text = response.text
-            elif hasattr(response, 'parts'):
-                text = ''.join(part.text for part in response.parts if hasattr(part, 'text'))
-            elif hasattr(response, 'candidates') and len(response.candidates) > 0:
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'content'):
-                    if hasattr(candidate.content, 'parts'):
-                        text = ''.join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
-                    elif hasattr(candidate.content, 'text'):
-                        text = candidate.content.text
-            
+            if hasattr(resp, "text") and resp.text:
+                text = resp.text
+            elif getattr(resp, "candidates", None):
+                cand = resp.candidates[0]
+                if getattr(cand, "content", None):
+                    parts = getattr(cand.content, "parts", None)
+                    if parts:
+                        text = "".join(getattr(p, "text", "") for p in parts if getattr(p, "text", None))
+                    elif getattr(cand.content, "text", None):
+                        text = cand.content.text
+
             if not text:
-                logger.warning("Gemini returned empty response")
                 raise ValueError("Gemini returned empty response")
-            
-            # Розрахунок вартості
-            tokens_in = 0
-            tokens_out = 0
-            
-            if hasattr(response, 'usage_metadata'):
-                tokens_in = getattr(response.usage_metadata, 'prompt_token_count', 0)
-                tokens_out = getattr(response.usage_metadata, 'candidates_token_count', 0)
-            
+
+            # Токени/вартість — м'які дефолти якщо usage_metadata відсутня
+            tokens_in = getattr(getattr(resp, "usage_metadata", None), "prompt_token_count", 0) or 0
+            tokens_out = getattr(getattr(resp, "usage_metadata", None), "candidates_token_count", 0) or 0
             if tokens_in == 0:
-                tokens_in = len(full_prompt.split())
+                tokens_in = len(user_message.split())
             if tokens_out == 0:
                 tokens_out = len(text.split())
-            
+
             cost = (tokens_in * 0.00000125) + (tokens_out * 0.00001)
-            
+
             logger.info(f"Gemini response length: {len(text)} chars")
-            
+
             return {
                 "response": text,
                 "provider": "gemini",
@@ -268,11 +280,11 @@ class MultiAIService:
                 },
                 "cost_estimate": round(cost, 6)
             }
-            
+
         except Exception as e:
             logger.error(f"Gemini API error: {e}")
             raise
-    
+
     async def _call_grok(
         self, 
         system_prompt: str, 
