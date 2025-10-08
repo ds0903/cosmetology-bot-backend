@@ -52,13 +52,13 @@ if __name__ == "__main__":
 
 Провайдери:
   claude    - Anthropic Claude Sonnet 4.5
-  gpt-o3    - OpenAI GPT o3
+  o3    - OpenAI GPT o3
   gemini    - Google Gemini 2.5 Pro
   grok      - xAI Grok 3
 
 Приклади:
   python simple_test.py claude "Привіт!"
-  python simple_test.py gpt-o3 "What is 2+2?"
+  python simple_test.py o3 "What is 2+2?"
   python simple_test.py gemini "Розкажи про квантові комп'ютери"
         """)
         sys.exit(1)
@@ -66,9 +66,9 @@ if __name__ == "__main__":
     provider = sys.argv[1]
     message = sys.argv[2] if len(sys.argv) > 2 else "Hello! How are you?"
     
-    if provider not in ["claude", "gpt-o3", "gemini", "grok"]:
+    if provider not in ["claude", "o3", "gemini", "grok"]:
         print(f"❌ Невірний провайдер: {provider}")
-        print("Доступні: claude, gpt-o3, gemini, grok")
+        print("Доступні: claude, o3, gemini, grok")
         sys.exit(1)
     
     asyncio.run(simple_test(provider, message))

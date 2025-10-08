@@ -30,7 +30,7 @@ class MultiAIAdapter:
         
         # Або динамічно
         ai_service = MultiAIAdapter(db)
-        ai_service.set_provider("gpt-o3")
+        ai_service.set_provider("o3")
     """
     
     def __init__(self, db, provider: AIProvider = None):
@@ -39,7 +39,7 @@ class MultiAIAdapter:
         
         Args:
             db: Database session
-            provider: AI модель ("claude", "gpt-o3", "gemini", "grok")
+            provider: AI модель ("claude", "o3", "gemini", "grok")
                      Якщо None - береться з settings.default_ai_provider
         """
         self.db = db
@@ -58,7 +58,7 @@ class MultiAIAdapter:
         # Лічильник запитів для статистики
         self.request_count = {
             "claude": 0,
-            "gpt-o3": 0,
+            "o3": 0,
             "gemini": 0,
             "grok": 0
         }

@@ -50,7 +50,7 @@ async def test_ai_model(request: TestMessageRequest):
     
     **Доступні провайдери:**
     - claude
-    - gpt-o3
+    - o3
     - gemini
     - grok
     """
@@ -122,7 +122,7 @@ async def check_ai_status():
     
     status = {
         "claude": service.claude_client is not None,
-        "gpt-o3": service.openai_client is not None,
+        "o3": service.openai_client is not None,
         "gemini": service.gemini_client is not None,
         "grok": service.grok_client is not None
     }

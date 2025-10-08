@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/ai", tags=["AI Model Management"])
 
-AIProvider = Literal["claude", "gpt-o3", "gemini", "grok"]
+AIProvider = Literal["claude", "o3", "gemini", "grok"]
 
 
 class SwitchProviderRequest(BaseModel):
@@ -41,7 +41,7 @@ async def get_current_model():
     return {
         "success": True,
         "current_provider": current,
-        "available_providers": ["claude", "gpt-o3", "gemini", "grok"]
+        "available_providers": ["claude", "o3", "gemini", "grok"]
     }
 
 
@@ -59,7 +59,7 @@ async def switch_model(request: SwitchProviderRequest):
     
     **Доступні моделі:**
     - claude
-    - gpt-o3
+    - o3
     - gemini
     - grok
     """
@@ -126,7 +126,7 @@ async def quick_switch(provider: AIProvider):
     **Приклади:**
     ```bash
     curl http://localhost:8000/admin/ai/quick-switch/gemini
-    curl http://localhost:8000/admin/ai/quick-switch/gpt-o3
+    curl http://localhost:8000/admin/ai/quick-switch/o3
     curl http://localhost:8000/admin/ai/quick-switch/grok
     curl http://localhost:8000/admin/ai/quick-switch/claude
     ```
