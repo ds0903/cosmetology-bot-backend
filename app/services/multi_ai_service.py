@@ -179,7 +179,7 @@ class MultiAIService:
             return "".join(out).strip()
 
         try:
-            # 3) Якщо це reasoning-модель o3 — Responses API БЕЗ response_format (не підтримується)
+            # 3) Якщо це reasoning-модель o3 — Responses API БЕЗ response_format і temperature
             if str(model).lower().startswith("o3"):
                 resp = await self.openai_client.responses.create(
                     model=model,
@@ -188,10 +188,10 @@ class MultiAIService:
                         {"role": "system", "content": enhanced_system},
                         {"role": "user", "content": user_message},
                     ],
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                    # response_format не підтримується для Responses API!
+                    # temperature НЕ підтримується для o3!
+                    # response_format НЕ підтримується для Responses API!
                     # JSON контролюється через промпт (enhanced_system)
+                    max_output_tokens=max_tokens,
                 )
                 text = _extract_responses_text(resp)
                 usage = getattr(resp, "usage", None)
