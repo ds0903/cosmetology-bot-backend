@@ -580,7 +580,7 @@ async def sendpulse_webhook(
         webhook_response = WebhookResponse(
             send_status=send_status,
             count=count,
-            gpt_response=final_gpt_response.replace('\\n', '\n'),
+            gpt_response=final_gpt_response,
             pic=final_pic,
             status="200",
             user_message=message.response
