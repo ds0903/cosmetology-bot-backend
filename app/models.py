@@ -142,10 +142,10 @@ class FeedbackRecord(BaseModel):
 
 class WebhookResponse(BaseModel):
     """Response sent back to SendPulse"""
-    send_status: str = Field(..., description="TRUE or FALSE")
     gpt_response: str = Field(..., description="Response text to send to client")
     pic: str = Field(default="", description="Picture URL, empty string if no picture")
     status: str = Field(default="200", description="HTTP status code")
+    send_status: str = Field(..., description="TRUE or FALSE")
     count: Optional[str] = Field(None, description="Error count as string, None if no errors but FALSE status, 0 if TRUE status")
     user_message: Optional[str] = Field(None, description="Message from user")
 

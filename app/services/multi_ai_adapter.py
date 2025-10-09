@@ -453,12 +453,18 @@ class MultiAIAdapter:
     def _normalize_main_response_fields(self, parsed: dict, message_id: str) -> dict:
         """Нормалізація полів для ClaudeMainResponse з підтримкою всіх можливих варіантів"""
         
+        # КРИТИЧНО: Детальне логування того що прийшло
+        logger.info(f"Message ID: {message_id} - RAW parsed dict keys: {list(parsed.keys())}")
+        logger.info(f"Message ID: {message_id} - RAW parsed dict (full): {json.dumps(parsed, ensure_ascii=False, indent=2)}")
+        
         # КРИТИЧНО: Обробка gpt_response з максимальною кількістю варіантів
         gpt_response = (parsed.get('gpt_response') or parsed.get('client_response') or 
                        parsed.get('response') or parsed.get('message') or 
                        parsed.get('answer') or parsed.get('reply') or
                        parsed.get('text') or parsed.get('bot_response') or
                        parsed.get('assistant_response'))
+        
+        logger.info(f"Message ID: {message_id} - Extracted gpt_response: {gpt_response}")
         
         # Якщо нічого не знайдено, створюємо дефолтну відповідь
         if not gpt_response:
