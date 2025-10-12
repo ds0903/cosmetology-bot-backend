@@ -212,7 +212,7 @@ class DialogueArchivingService:
         
         return activity.zip_history if activity else None
     
-    def add_dialogue_entry(self, db: Session, project_id: str, client_id: str, role: str, message: str):
+    def add_dialogue_entry(self, db: Session, project_id: str, client_id: str, role: str, message: str, is_first_message: bool = False):
         """Add new dialogue entry and update client activity"""
         # Add dialogue entry
         dialogue = Dialogue(
@@ -220,7 +220,8 @@ class DialogueArchivingService:
             client_id=client_id,
             role=role,
             message=message,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.utcnow(),
+            is_first_message=is_first_message
         )
         db.add(dialogue)
         

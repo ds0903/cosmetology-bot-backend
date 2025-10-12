@@ -271,6 +271,85 @@ async def root():
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow()}
 
+
+async def process_first_message_with_ai(
+    project_id: str,
+    client_id: str, 
+    message_text: str,
+    message_id: str,
+    contact_send_id: str,
+    db: Session
+) -> dict:
+    """
+    Process first message from client through AI synchronously
+    Returns AI response to be included in webhook response
+    """
+    logger.info(f"Message ID: {message_id} - 🚀 Processing FIRST MESSAGE through AI for client_id={client_id}")
+    
+    try:
+        # Save first message to DB
+        save_dialogue_entry(db, project_id, client_id, message_text, "client", message_id)
+        logger.info(f"Message ID: {message_id} - First message saved to DB")
+        
+        # Get project config
+        project_config = project_configs.get(project_id, project_configs.get("default"))
+        if not project_config:
+            logger.error(f"Message ID: {message_id} - No project config for {project_id}")
+            return {"gpt_response": "Ошибка конфигурации", "pic": ""}
+        
+        # Initialize AI service
+        from app.services.multi_ai_adapter import MultiAIAdapter
+        from app.services.provider_switcher import get_current_provider
+        
+        current_provider = get_current_provider()
+        ai_service = MultiAIAdapter(db, provider=current_provider)
+        booking_service = BookingService(db, project_config, contact_send_id=contact_send_id)
+        
+        # Get current date and time
+        berlin_tz = pytz.timezone('Europe/Berlin')
+        berlin_now = datetime.now(berlin_tz)
+        current_date = berlin_now.strftime("%d.%m.%Y %H:%M")
+        day_of_week = berlin_now.strftime("%A")
+        
+        # Get client bookings
+        try:
+            client_bookings = await asyncio.to_thread(booking_service.get_client_bookings_as_string, client_id)
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Error getting client bookings: {e}")
+            client_bookings = ""
+        
+        # Generate AI response (quick, without slots for first message)
+        logger.info(f"Message ID: {message_id} - Generating AI response for first message")
+        main_response = await ai_service.generate_main_response(
+            project_config,
+            "",  # Empty dialogue history for first message
+            message_text,
+            current_date,
+            day_of_week,
+            {},  # No available slots for first quick response
+            {},  # No reserved slots
+            client_bookings,
+            message_id,
+            None,  # No target date
+            None,  # No zip history yet
+            None,  # No record error
+            newbie_status=1  # First time client
+        )
+        
+        # Save AI response to DB
+        save_dialogue_entry(db, project_id, client_id, main_response.gpt_response, "claude", message_id)
+        logger.info(f"Message ID: {message_id} - ✅ First message AI response generated and saved")
+        
+        return {
+            "gpt_response": main_response.gpt_response,
+            "pic": main_response.pic or ""
+        }
+        
+    except Exception as e:
+        logger.error(f"Message ID: {message_id} - Error processing first message with AI: {e}", exc_info=True)
+        return {"gpt_response": "Ошибка обработки сообщения", "pic": ""}
+
+
 @app.post("/make/add-template-message")
 async def add_template_message(request: Request):
     """
@@ -445,6 +524,38 @@ async def sendpulse_webhook(
     logger.info(f"Message {message.response} get UUID: {message_id}")
     logger.info(f"Message ID: {message_id} - Webhook received: project_id={message.project_id}, client_id={client_id}, count={message.count}, retry={message.retry}")
     logger.debug(f"Message ID: {message_id} - Message content: '{message.response[:200]}...'")
+    
+    # 🔥 CHECK IF THIS IS FIRST MESSAGE FROM CLIENT
+    is_first_message = db.query(Dialogue).filter(
+        Dialogue.project_id == message.project_id,
+        Dialogue.client_id == client_id,
+        Dialogue.role == "client"
+    ).count() == 0
+    
+    if is_first_message:
+        logger.info(f"Message ID: {message_id} - 🎯 FIRST MESSAGE DETECTED from client_id={client_id}")
+        logger.info(f"Message ID: {message_id} - Processing first message SYNCHRONOUSLY to return AI response immediately")
+        
+        # Process first message through AI synchronously
+        ai_response = await process_first_message_with_ai(
+            message.project_id,
+            client_id,
+            message.response,
+            message_id,
+            contact_send_id,
+            db
+        )
+        
+        # Return AI response immediately - SendPulse will send it as second message after hardcode
+        logger.info(f"Message ID: {message_id} - 🎉 Returning AI response for first message: '{ai_response['gpt_response'][:100]}...'")
+        return WebhookResponse(
+            send_status="TRUE",
+            count="0",
+            gpt_response=ai_response["gpt_response"],
+            pic=ai_response["pic"],
+            status="200",
+            user_message=message.response
+        )
     
     error_count = 0
     
@@ -1165,10 +1276,21 @@ def save_dialogue_entry(db: Session, project_id: str, client_id: str, message: s
     
     logger.debug(f"Message ID: {message_id} - Saving dialogue entry: client_id={client_id}, role={role}, message_length={len(message)}")
     
-    dialogue_service = DialogueArchivingService()
-    dialogue_service.add_dialogue_entry(db, project_id, client_id, role, message)
+    # Check if this is the first message from client
+    is_first = False
+    if role == "client":
+        existing_messages = db.query(Dialogue).filter(
+            Dialogue.project_id == project_id,
+            Dialogue.client_id == client_id,
+            Dialogue.role == "client"
+        ).count()
+        is_first = (existing_messages == 0)
+        logger.info(f"Message ID: {message_id} - First message check for client_id={client_id}: is_first={is_first}")
     
-    logger.debug(f"Message ID: {message_id} - Dialogue entry saved successfully for client_id={client_id}, role={role}")
+    dialogue_service = DialogueArchivingService()
+    dialogue_service.add_dialogue_entry(db, project_id, client_id, role, message, is_first_message=is_first)
+    
+    logger.debug(f"Message ID: {message_id} - Dialogue entry saved successfully for client_id={client_id}, role={role}, is_first={is_first}")
 
 
 def parse_date(date_str: str) -> Optional[date]:

@@ -24,28 +24,31 @@ class SendPulseService:
         count: str = "0",
         send_status: str = "TRUE"
     ) -> bool:
-        """Send response back to SendPulse API"""
+        """Send response back to SendPulse via webhook callback or direct API"""
         try:
-            if not self.api_url or not self.api_token:
-                logger.warning("SendPulse API URL or token not configured, skipping response send")
-                return False
+            if not self.api_url:
+                logger.warning("SendPulse API URL not configured, response will not be sent")
+                logger.info(f"Would send to client_id={client_id}: {response_text[:100]}...")
+                return True  # Return True to not block the flow
             
+            # Prepare payload for SendPulse
             payload = {
-                "client_id": client_id,
-                "project_id": project_id,
-                "gpt_response": response_text,
-                "pic": pic,
-                "count": count,
-                "send_status": send_status
+                "contact_id": client_id,
+                "message": response_text
             }
             
+            if pic:
+                payload["image_url"] = pic
+            
             headers = {
-                "Authorization": f"Bearer {self.api_token}",
                 "Content-Type": "application/json"
             }
             
-            logger.info(f"Sending response to SendPulse API for client_id={client_id}")
-            logger.info(f"Response length: {len(response_text)} chars, send_status: {send_status}, count: {count}")
+            if self.api_token:
+                headers["Authorization"] = f"Bearer {self.api_token}"
+            
+            logger.info(f"Sending message to SendPulse for client_id={client_id}")
+            logger.debug(f"Payload: {payload}")
             
             response = await self.client.post(
                 self.api_url,
@@ -53,7 +56,7 @@ class SendPulseService:
                 headers=headers
             )
             
-            if response.status_code == 200:
+            if response.status_code in [200, 201]:
                 logger.info(f"Successfully sent response to SendPulse for client_id={client_id}")
                 return True
             else:

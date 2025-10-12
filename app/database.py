@@ -115,6 +115,7 @@ class Dialogue(Base):
     is_archived = Column(Boolean, default=False)
     archive_hours = Column(Integer, default=settings.dialogue_archive_hours)
     compressed_content = Column(Text, nullable=True)
+    is_first_message = Column(Boolean, default=False)
     
     project = relationship("Project", back_populates="dialogues")
 
