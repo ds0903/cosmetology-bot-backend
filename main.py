@@ -527,6 +527,16 @@ async def sendpulse_webhook(
     logger.info(f"Message ID: {message_id} - Webhook received: project_id={message.project_id}, client_id={client_id}, count={message.count}, retry={message.retry}")
     logger.debug(f"Message ID: {message_id} - Message content: '{message.response[:200]}...'")
     
+    # DEBUG: Log full message structure to understand SendPulse format
+    logger.info(f"Message ID: {message_id} - 📸 FULL MESSAGE: {message.model_dump()}")
+    logger.info(f"Message ID: {message_id} - 📸 Has attachments: {message.attachments}")
+    logger.info(f"Message ID: {message_id} - 📸 Has image_url: {message.image_url}")
+    
+    # Log full message structure to debug SendPulse format
+    logger.info(f"Message ID: {message_id} - FULL MESSAGE STRUCTURE: {message.model_dump()}")
+    logger.info(f"Message ID: {message_id} - Has attachments: {message.attachments is not None}")
+    logger.info(f"Message ID: {message_id} - Has image_url field: {message.image_url is not None}")
+    
     # 🔥 CHECK IF THIS IS FIRST MESSAGE FROM CLIENT
     is_first_message = db.query(Dialogue).filter(
         Dialogue.project_id == message.project_id,

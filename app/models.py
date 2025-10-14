@@ -39,8 +39,8 @@ class SendPulseMessage(BaseModel):
     attachments: Optional[List[Attachment]] = Field(None, description="List of attachments from SendPulse")
     
     def get_image_url(self) -> Optional[str]:
-        """Get image URL from either direct field or attachments"""
-        # First check direct URL
+        """Get image URL from either direct field, attachments, or message text"""
+        # First check direct URL field
         if self.image_url:
             return self.image_url
         
@@ -50,7 +50,39 @@ class SendPulseMessage(BaseModel):
                 if attachment.type in ["photo", "image"]:
                     return attachment.url
         
+        # Finally, check if URL is in message text (SendPulse WhatsApp format)
+        import re
+        # Look for SendPulse media URLs in the text
+        sendpulse_pattern = r'https://[\w\-\.]+/api/chatbots-service/whatsapp/messages/media\?[^\s]+'
+        match = re.search(sendpulse_pattern, self.response)
+        if match:
+            return match.group(0)
+        
+        # Look for other image URLs
+        url_pattern = r'https?://[^\s]+\.(jpg|jpeg|png|gif|webp)'
+        match = re.search(url_pattern, self.response, re.IGNORECASE)
+        if match:
+            return match.group(0)
+        
         return None
+    
+    def get_text_without_image_url(self) -> str:
+        """Get message text with image URLs removed"""
+        import re
+        text = self.response
+        
+        # Remove SendPulse media URLs
+        sendpulse_pattern = r'https://[\w\-\.]+/api/chatbots-service/whatsapp/messages/media\?[^\s]+'
+        text = re.sub(sendpulse_pattern, '', text)
+        
+        # Remove other image URLs
+        url_pattern = r'https?://[^\s]+\.(jpg|jpeg|png|gif|webp)'
+        text = re.sub(url_pattern, '', text, flags=re.IGNORECASE)
+        
+        # Clean up extra whitespace
+        text = ' '.join(text.split())
+        
+        return text.strip()
 
 
 class MessageQueueItem(BaseModel):

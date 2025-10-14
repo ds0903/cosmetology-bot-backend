@@ -83,14 +83,13 @@ class MultiAIAdapter:
         try:
             logger.info(f"Message ID: {message_id} - Downloading image from {image_url}")
             
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(image_url)
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                response = await client.get(image_url, headers=headers)
                 response.raise_for_status()
                 
-                # Get content type
                 content_type = response.headers.get('content-type', 'image/jpeg')
-                
-                # Convert to base64
                 image_base64 = base64.b64encode(response.content).decode('utf-8')
                 
                 logger.info(f"Message ID: {message_id} - Image downloaded successfully, size: {len(response.content)} bytes")
