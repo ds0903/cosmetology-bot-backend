@@ -300,7 +300,6 @@ class MultiAIAdapter:
             logger.info(f"Message ID: {message_id} - Processing image: {image_url}")
             image_content = await self._download_image_as_base64(image_url, message_id)
             if image_content:
-                user_prompt_parts.append("⚠️ Користувач надіслав зображення. Проаналізуй його.")
                 logger.info(f"Message ID: {message_id} - Image content prepared for AI")
         
         user_prompt = "\n".join(user_prompt_parts)
@@ -308,8 +307,11 @@ class MultiAIAdapter:
         try:
             # Use multi-modal for Claude with images
             if image_content and self.current_provider == "claude":
-                # For Claude, use content blocks
-                user_content = [image_content, {"type": "text", "text": user_prompt}]
+                # For Claude Vision API: text first, then image
+                user_content = [
+                    {"type": "text", "text": user_prompt},
+                    image_content
+                ]
                 result = await self.multi_ai.send_message(
                     provider=self.current_provider,
                     system_prompt=self._enhance_prompt_for_provider(system_prompt, self.current_provider),

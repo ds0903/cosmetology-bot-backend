@@ -111,12 +111,18 @@ class MultiAIService:
         if not self.claude_client:
             raise ValueError("Claude client not initialized. Check CLAUDE_API_KEY_1")
         
+        # Підтримка мультимодального контенту (з зображеннями)
+        if isinstance(user_message, list):
+            content = user_message  # Вже у форматі content blocks
+        else:
+            content = user_message  # Звичайний текст
+        
         response = await self.claude_client.messages.create(
             model=settings.claude_model,
             max_tokens=max_tokens,
             temperature=temperature,
             system=system_prompt,
-            messages=[{"role": "user", "content": user_message}]
+            messages=[{"role": "user", "content": content}]
         )
         
         text = response.content[0].text
