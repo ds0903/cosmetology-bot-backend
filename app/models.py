@@ -18,6 +18,12 @@ class BookingAction(str, Enum):
     CHANGE = "change_order"
 
 
+class Attachment(BaseModel):
+    """Attachment from SendPulse"""
+    type: str = Field(..., description="Type: photo, video, document")
+    url: str = Field(..., description="URL to file")
+
+
 class SendPulseMessage(BaseModel):
     """Message received from SendPulse webhook"""
     date: str = Field(..., description="Date in format 02.07.2025 19:18")
@@ -25,9 +31,26 @@ class SendPulseMessage(BaseModel):
     retry: bool = Field(default=False, description="Whether this is a retry attempt")
     tg_id: Optional[str] = Field(None, description="Telegram client ID")
     contact_send_id: Optional[str] = Field(None, description="SendPulse internal contact ID")
-    contact_send_id: Optional[str] = Field(None, description="SendPulse internal contact ID")
     response: str = Field(..., description="Message text from client")
     project_id: str = Field(..., description="Project identifier")
+    
+    # Image support fields
+    image_url: Optional[str] = Field(None, description="Direct URL of image from user")
+    attachments: Optional[List[Attachment]] = Field(None, description="List of attachments from SendPulse")
+    
+    def get_image_url(self) -> Optional[str]:
+        """Get image URL from either direct field or attachments"""
+        # First check direct URL
+        if self.image_url:
+            return self.image_url
+        
+        # Then check attachments
+        if self.attachments:
+            for attachment in self.attachments:
+                if attachment.type in ["photo", "image"]:
+                    return attachment.url
+        
+        return None
 
 
 class MessageQueueItem(BaseModel):

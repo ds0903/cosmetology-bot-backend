@@ -6,6 +6,8 @@
 import json
 import logging
 import re
+import base64
+import httpx
 from typing import Dict, Any, Optional, Literal
 from datetime import datetime
 
@@ -75,6 +77,36 @@ class MultiAIAdapter:
             "total_requests": sum(self.request_count.values()),
             "total_cost_estimate": round(self.total_cost, 6)
         }
+    
+    async def _download_image_as_base64(self, image_url: str, message_id: str = None) -> Optional[dict]:
+        """Download image from URL and convert to base64 for AI models"""
+        try:
+            logger.info(f"Message ID: {message_id} - Downloading image from {image_url}")
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(image_url)
+                response.raise_for_status()
+                
+                # Get content type
+                content_type = response.headers.get('content-type', 'image/jpeg')
+                
+                # Convert to base64
+                image_base64 = base64.b64encode(response.content).decode('utf-8')
+                
+                logger.info(f"Message ID: {message_id} - Image downloaded successfully, size: {len(response.content)} bytes")
+                
+                return {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": content_type,
+                        "data": image_base64
+                    }
+                }
+                
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Failed to download image: {e}")
+            return None
     
     def _enhance_prompt_for_provider(self, base_prompt: str, provider: str) -> str:
         """Адаптує промпт під конкретну модель"""
@@ -232,7 +264,8 @@ class MultiAIAdapter:
         slots_target_date: Optional[str] = None,
         zip_history: Optional[str] = None,
         record_error: Optional[str] = None,
-        newbie_status: int = 1
+        newbie_status: int = 1,
+        image_url: Optional[str] = None  # NEW PARAMETER for image support
     ) -> ClaudeMainResponse:
         """
         Module 3: Main response generation
@@ -262,10 +295,36 @@ class MultiAIAdapter:
         if slots_target_date:
             user_prompt_parts.append(f"slots_target_date: {slots_target_date}")
         
+        # Handle image if provided
+        image_content = None
+        if image_url:
+            logger.info(f"Message ID: {message_id} - Processing image: {image_url}")
+            image_content = await self._download_image_as_base64(image_url, message_id)
+            if image_content:
+                user_prompt_parts.append("⚠️ Користувач надіслав зображення. Проаналізуй його.")
+                logger.info(f"Message ID: {message_id} - Image content prepared for AI")
+        
         user_prompt = "\n".join(user_prompt_parts)
         
         try:
-            result = await self._call_ai(system_prompt, user_prompt, max_tokens=2000)
+            # Use multi-modal for Claude with images
+            if image_content and self.current_provider == "claude":
+                # For Claude, use content blocks
+                user_content = [image_content, {"type": "text", "text": user_prompt}]
+                result = await self.multi_ai.send_message(
+                    provider=self.current_provider,
+                    system_prompt=self._enhance_prompt_for_provider(system_prompt, self.current_provider),
+                    user_message=user_content,
+                    max_tokens=2000
+                )
+                logger.info(f"Message ID: {message_id} - Claude Vision API called with image")
+            else:
+                # For other models or no image
+                if image_content:
+                    logger.warning(f"Message ID: {message_id} - Image provided but {self.current_provider} may not support Vision API")
+                    user_prompt += "\n\n[Користувач надіслав зображення, але поточна модель може не підтримувати Vision API]"
+                
+                result = await self._call_ai(system_prompt, user_prompt, max_tokens=2000)
             raw_response = result.get("response", result.get("text", ""))
             
             logger.info(f"Message ID: {message_id} - Raw main response ({self.current_provider}): {raw_response[:200]}")

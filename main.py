@@ -278,7 +278,8 @@ async def process_first_message_with_ai(
     message_text: str,
     message_id: str,
     contact_send_id: str,
-    db: Session
+    db: Session,
+    image_url: Optional[str] = None
 ) -> dict:
     """
     Process first message from client through AI synchronously
@@ -319,7 +320,7 @@ async def process_first_message_with_ai(
             client_bookings = ""
         
         # Generate AI response (quick, without slots for first message)
-        logger.info(f"Message ID: {message_id} - Generating AI response for first message")
+        logger.info(f"Message ID: {message_id} - Generating AI response for first message (image: {image_url is not None})")
         main_response = await ai_service.generate_main_response(
             project_config,
             "",  # Empty dialogue history for first message
@@ -333,7 +334,8 @@ async def process_first_message_with_ai(
             None,  # No target date
             None,  # No zip history yet
             None,  # No record error
-            newbie_status=1  # First time client
+            newbie_status=1,  # First time client
+            image_url=image_url  # Pass image if provided
         )
         
         # Save AI response to DB
@@ -532,9 +534,14 @@ async def sendpulse_webhook(
         Dialogue.role == "client"
     ).count() == 0
     
+    # Get image URL if provided
+    image_url = message.get_image_url()
+    
     if is_first_message:
         logger.info(f"Message ID: {message_id} - 🎯 FIRST MESSAGE DETECTED from client_id={client_id}")
-        logger.info(f"Message ID: {message_id} - Processing first message SYNCHRONOUSLY to return AI response immediately")
+        logger.info(f"Message ID: {message_id} - Processing first message SYNCHRONOUSLY (image: {image_url is not None})")
+        if image_url:
+            logger.info(f"Message ID: {message_id} - First message includes image: {image_url}")
         
         # Process first message through AI synchronously
         ai_response = await process_first_message_with_ai(
@@ -543,7 +550,8 @@ async def sendpulse_webhook(
             message.response,
             message_id,
             contact_send_id,
-            db
+            db,
+            image_url=image_url
         )
         
         # Return AI response immediately - SendPulse will send it as second message after hardcode
@@ -622,12 +630,14 @@ async def sendpulse_webhook(
             )
         
         # Process the message directly and wait for response
-        logger.info(f"Message ID: {message_id} - Processing message directly for client_id={client_id}")
+        logger.info(f"Message ID: {message_id} - Processing message directly for client_id={client_id} (image: {image_url is not None})")
         response_data = await process_message_async(
             message.project_id,
             client_id,
             queue_result["queue_item_id"],
-            message_id, contact_send_id
+            message_id,
+            contact_send_id,
+            image_url=image_url
         )
         
         if not response_data:
@@ -712,7 +722,7 @@ async def sendpulse_webhook(
         )
 
 
-async def process_message_async(project_id: str, client_id: str, queue_item_id: str, message_id: str, contact_send_id: str = None) -> dict:
+async def process_message_async(project_id: str, client_id: str, queue_item_id: str, message_id: str, contact_send_id: str = None, image_url: Optional[str] = None) -> dict:
     """
     Process message with AI and return response data
     This implements the full processing pipeline from the technical specification
@@ -1045,7 +1055,8 @@ async def process_message_async(project_id: str, client_id: str, queue_item_id: 
                     slots_target_date,  # Pass the target date information
                     zip_history,  # Pass compressed dialogue history
                     record_error,
-                    newbie_status=newbie_status
+                    newbie_status=newbie_status,
+                    image_url=image_url  # Pass image if provided
                 )
                 logger.debug(f"Message ID: {message_id} - Main response generated for client_id={client_id}: activate_booking={main_response.activate_booking}, reject_order={main_response.reject_order}, change_order={main_response.change_order}")
             except Exception as e:

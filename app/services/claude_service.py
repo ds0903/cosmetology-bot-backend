@@ -2,6 +2,8 @@ import json
 import re
 import asyncio
 import random
+import base64
+import httpx
 from typing import Dict, Any, Optional
 from datetime import datetime, date, timedelta
 from anthropic import AsyncAnthropic
@@ -52,7 +54,35 @@ class ClaudeService:
         self.request_counter += 1
         return self.request_counter
     
-
+    async def _download_image_as_base64(self, image_url: str, message_id: str = None) -> Optional[dict]:
+        """Download image from URL and convert to base64 for Claude Vision API"""
+        try:
+            logger.info(f"Message ID: {message_id} - Downloading image from {image_url}")
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(image_url)
+                response.raise_for_status()
+                
+                # Get content type
+                content_type = response.headers.get('content-type', 'image/jpeg')
+                
+                # Convert to base64
+                image_base64 = base64.b64encode(response.content).decode('utf-8')
+                
+                logger.info(f"Message ID: {message_id} - Image downloaded successfully, size: {len(response.content)} bytes, base64 size: {len(image_base64)} chars")
+                
+                return {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": content_type,
+                        "data": image_base64
+                    }
+                }
+                
+        except Exception as e:
+            logger.error(f"Message ID: {message_id} - Failed to download image: {e}")
+            return None
     
     def _truncate_dialogue_for_logging(self, dialogue_history: str) -> str:
         """Truncate dialogue history to last 3 messages for logging purposes"""
@@ -491,7 +521,8 @@ current_message: {current_message}"""
         slots_target_date: Optional[str] = None,
         zip_history: Optional[str] = None,
         record_error: Optional[str] = None,
-        newbie_status: int = 1  # ДОБАВЛЯЕМ ПАРАМЕТР
+        newbie_status: int = 1,
+        image_url: Optional[str] = None  # NEW PARAMETER for image support
     ) -> ClaudeMainResponse:
         """
         Module 3: Main response with proper caching separation
@@ -506,10 +537,10 @@ current_message: {current_message}"""
         # DYNAMIC user prompt (все переменные данные)
         user_prompt_parts = [
             f"current_date: {current_date}",
-            f"newbie_massage: {newbie_status} (1=новичок в массаже, 0=уже был на массаже)"
+            f"newbie_massage: {newbie_status} (1=новичок в массаже, 0=уже был на массаже)",
             f"dialogue_history: {dialogue_history}",
             f"current_message: {current_message}",
-            f"day_of_week: {day_of_week}",  # Добавляем эту строку
+            f"day_of_week: {day_of_week}",
             f"available_slots: {json.dumps(available_slots, ensure_ascii=False)}",
             f"reserved_slots: {json.dumps(reserved_slots, ensure_ascii=False)}",
             f"rows_of_owner: {rows_of_owner}"
@@ -521,8 +552,29 @@ current_message: {current_message}"""
             user_prompt_parts.append(f"record_error: {record_error}")
         if slots_target_date:
             user_prompt_parts.append(f"slots_target_date: {slots_target_date}")
-            
+        
+        # Prepare content blocks for multi-modal support
+        user_content = []
+        
+        # Add image if provided
+        if image_url:
+            logger.info(f"Message ID: {message_id} - Processing image: {image_url}")
+            image_content = await self._download_image_as_base64(image_url, message_id)
+            if image_content:
+                user_content.append(image_content)
+                user_prompt_parts.append("⚠️ Користувач надіслав зображення. Проаналізуй його та дай відповідь на основі зображення.")
+                logger.info(f"Message ID: {message_id} - Image added to content blocks")
+            else:
+                logger.warning(f"Message ID: {message_id} - Failed to download image, proceeding without it")
+        
+        # Add text content
         user_prompt = "\n".join(user_prompt_parts)
+        user_content.append({
+            "type": "text",
+            "text": user_prompt
+        })
+        
+        logger.info(f"Message ID: {message_id} - User content blocks: {len(user_content)} (text + {1 if image_url else 0} image)")
         
         logger.info(f"Message ID: {message_id} - Prompts: system={len(system_prompt)} chars (static), user={len(user_prompt)} chars (dynamic)")
         
@@ -533,14 +585,26 @@ current_message: {current_message}"""
             
             # Define the request function for retry mechanism
             async def make_request(client):
-                return await self._cached_claude_request(
-                    client=client,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    max_tokens=2000,
-                    use_hour_cache=True,
-                    message_id=message_id
-                )
+                # Build request kwargs
+                kwargs = {
+                    "model": settings.claude_model,
+                    "max_tokens": 2000,
+                    "messages": [{"role": "user", "content": user_content}]
+                }
+                
+                # Add system prompt with caching
+                if system_prompt:
+                    kwargs["system"] = [
+                        {
+                            "type": "text",
+                            "text": system_prompt,
+                            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                        }
+                    ]
+                    kwargs["extra_headers"] = {"anthropic-beta": "extended-cache-ttl-2025-04-11"}
+                
+                return await client.messages.create(**kwargs)
+            
             # Use retry mechanism
             response = await self._retry_claude_request(make_request, max_retries=3, message_id=message_id)
             
